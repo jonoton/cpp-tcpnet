@@ -2,6 +2,7 @@
 
 #include <iostream>
 #include <vector>
+#include <variant>
 #include <thread>
 #include <functional>
 #include <atomic>
@@ -82,7 +83,7 @@ using pollfd_t = struct pollfd;
 namespace cpptcpnet
 {
     constexpr int VERSION_MAJOR = 1;
-    constexpr int VERSION_MINOR = 0;
+    constexpr int VERSION_MINOR = 1;
     constexpr int VERSION_PATCH = 0;
 
     /**
@@ -478,6 +479,183 @@ namespace cpptcpnet
             socket_t read_fd_;
             socket_t write_fd_;
         };
+
+        using OutboundData = std::variant<
+            std::vector<uint8_t>,
+            std::string,
+            std::shared_ptr<const std::vector<uint8_t>>,
+            std::shared_ptr<const std::string>>;
+
+        struct OutboundChunk
+        {
+            OutboundData data;
+            size_t offset = 0;
+
+            const uint8_t *ptr() const
+            {
+                return std::visit([this](const auto &val) -> const uint8_t *
+                                  {
+                    using T = std::decay_t<decltype(val)>;
+                    if constexpr (std::is_same_v<T, std::vector<uint8_t>>) {
+                        return val.data() + offset;
+                    } else if constexpr (std::is_same_v<T, std::string>) {
+                        return reinterpret_cast<const uint8_t*>(val.data()) + offset;
+                    } else if constexpr (std::is_same_v<T, std::shared_ptr<const std::vector<uint8_t>>>) {
+                        return val ? (val->data() + offset) : nullptr;
+                    } else if constexpr (std::is_same_v<T, std::shared_ptr<const std::string>>) {
+                        return val ? (reinterpret_cast<const uint8_t*>(val->data()) + offset) : nullptr;
+                    }
+                    return nullptr; }, data);
+            }
+
+            size_t size() const
+            {
+                return std::visit([](const auto &val) -> size_t
+                                  {
+                    using T = std::decay_t<decltype(val)>;
+                    if constexpr (std::is_same_v<T, std::shared_ptr<const std::vector<uint8_t>>> ||
+                                  std::is_same_v<T, std::shared_ptr<const std::string>>) {
+                        return val ? val->size() : 0;
+                    } else {
+                        return val.size();
+                    } }, data);
+            }
+
+            size_t remaining() const
+            {
+                return (offset < size()) ? (size() - offset) : 0;
+            }
+        };
+
+        struct OutboundBuffer
+        {
+            std::deque<OutboundChunk> chunks;
+            size_t total_bytes = 0;
+        };
+
+        template <typename T>
+        size_t GetDataSize(const T &val)
+        {
+            if constexpr (std::is_same_v<std::decay_t<T>, std::shared_ptr<const std::vector<uint8_t>>> ||
+                          std::is_same_v<std::decay_t<T>, std::shared_ptr<const std::string>>)
+            {
+                return val ? val->size() : 0;
+            }
+            else
+            {
+                return val.size();
+            }
+        }
+
+        struct SocketOptions
+        {
+            bool no_delay = false;
+            int socket_recv_buffer_size = 0;
+            int socket_send_buffer_size = 0;
+            bool keepalive_enabled = true;
+            int keepalive_idle_secs = -1;
+            int keepalive_interval_secs = -1;
+            int keepalive_count = -1;
+            bool linger_enabled = false;
+            int linger_timeout_secs = 0;
+        };
+
+        inline void ApplySocketOptions(socket_t fd, const SocketOptions &opts)
+        {
+            if (opts.no_delay)
+            {
+                int opt = 1;
+#ifdef _WIN32
+                setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, reinterpret_cast<const char *>(&opt), sizeof(opt));
+#else
+                setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &opt, sizeof(opt));
+#endif
+            }
+
+            if (opts.socket_recv_buffer_size > 0)
+            {
+                int rcv_buf = opts.socket_recv_buffer_size;
+#ifdef _WIN32
+                setsockopt(fd, SOL_SOCKET, SO_RCVBUF, reinterpret_cast<const char *>(&rcv_buf), sizeof(rcv_buf));
+#else
+                setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &rcv_buf, sizeof(rcv_buf));
+#endif
+            }
+
+            if (opts.socket_send_buffer_size > 0)
+            {
+                int snd_buf = opts.socket_send_buffer_size;
+#ifdef _WIN32
+                setsockopt(fd, SOL_SOCKET, SO_SNDBUF, reinterpret_cast<const char *>(&snd_buf), sizeof(snd_buf));
+#else
+                setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &snd_buf, sizeof(snd_buf));
+#endif
+            }
+
+            if (opts.keepalive_enabled)
+            {
+                int opt = 1;
+#ifdef _WIN32
+                setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, reinterpret_cast<const char *>(&opt), sizeof(opt));
+#else
+                setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &opt, sizeof(opt));
+#endif
+                int idle = opts.keepalive_idle_secs;
+                int interval = opts.keepalive_interval_secs;
+                int count = opts.keepalive_count;
+
+#ifdef _WIN32
+                if (idle > 0 || interval > 0)
+                {
+                    struct tcp_keepalive vals;
+                    vals.onoff = 1;
+                    vals.keepalivetime = (idle > 0) ? (idle * 1000) : 7200000;
+                    vals.keepaliveinterval = (interval > 0) ? (interval * 1000) : 1000;
+                    DWORD bytes_returned = 0;
+                    WSAIoctl(fd, SIO_KEEPALIVE_VALS, &vals, sizeof(vals), nullptr, 0, &bytes_returned, nullptr, nullptr);
+                }
+#elif defined(__linux__)
+                if (idle > 0)
+                {
+                    setsockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE, &idle, sizeof(idle));
+                }
+                if (interval > 0)
+                {
+                    setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL, &interval, sizeof(interval));
+                }
+                if (count > 0)
+                {
+                    setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT, &count, sizeof(count));
+                }
+#elif defined(__APPLE__)
+                if (idle > 0)
+                {
+                    setsockopt(fd, IPPROTO_TCP, TCP_KEEPALIVE, &idle, sizeof(idle));
+                }
+#endif
+            }
+            else
+            {
+                int opt = 0;
+#ifdef _WIN32
+                setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, reinterpret_cast<const char *>(&opt), sizeof(opt));
+#else
+                setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &opt, sizeof(opt));
+#endif
+            }
+
+            if (opts.linger_enabled)
+            {
+                struct linger so_linger;
+                so_linger.l_onoff = 1;
+                so_linger.l_linger = opts.linger_timeout_secs;
+#ifdef _WIN32
+                setsockopt(fd, SOL_SOCKET, SO_LINGER, reinterpret_cast<const char *>(&so_linger), sizeof(so_linger));
+#else
+                setsockopt(fd, SOL_SOCKET, SO_LINGER, &so_linger, sizeof(so_linger));
+#endif
+            }
+        }
     }
 
     /**
@@ -561,6 +739,106 @@ namespace cpptcpnet
     {
         bool enabled = false;
         int timeout_secs = 0;
+    };
+
+    /**
+     * @brief A configuration profile that groups socket and application-level network parameters.
+     */
+    struct ConnectionProfile
+    {
+        // Socket-level settings
+        bool no_delay = false;
+        int socket_recv_buffer_size = 0; // 0 = OS default
+        int socket_send_buffer_size = 0; // 0 = OS default
+        bool keepalive_enabled = true;
+        int keepalive_idle_secs = -1;
+        int keepalive_interval_secs = -1;
+        int keepalive_count = -1;
+        bool linger_enabled = false;
+        int linger_timeout_secs = 0;
+
+        // Application-level settings
+        size_t recv_buffer_size = 4096;
+        size_t send_chunk_size = 65536;
+        size_t max_outbound_buffer_size = 10 * 1024 * 1024;
+
+        // Timeouts
+        std::chrono::milliseconds idle_timeout{60000};
+        std::chrono::milliseconds send_timeout{30000};
+        std::chrono::milliseconds connect_timeout{10000};
+
+        /**
+         * @brief Converts the profile settings into internal socket options.
+         */
+        internal::SocketOptions ToSocketOptions() const
+        {
+            internal::SocketOptions opts;
+            opts.no_delay = no_delay;
+            opts.socket_recv_buffer_size = socket_recv_buffer_size;
+            opts.socket_send_buffer_size = socket_send_buffer_size;
+            opts.keepalive_enabled = keepalive_enabled;
+            opts.keepalive_idle_secs = keepalive_idle_secs;
+            opts.keepalive_interval_secs = keepalive_interval_secs;
+            opts.keepalive_count = keepalive_count;
+            opts.linger_enabled = linger_enabled;
+            opts.linger_timeout_secs = linger_timeout_secs;
+            return opts;
+        }
+
+        /**
+         * @brief Returns a preset profile optimized for high latency / high BDP connections (e.g. satellite).
+         */
+        static ConnectionProfile HighLatency()
+        {
+            ConnectionProfile p;
+            p.no_delay = true;
+            p.socket_recv_buffer_size = 512 * 1024; // 512KB for large TCP window
+            p.socket_send_buffer_size = 512 * 1024;
+            p.recv_buffer_size = 65536; // 64KB application read buffer
+            p.send_chunk_size = 65536;
+            p.idle_timeout = std::chrono::milliseconds(120000);
+            p.send_timeout = std::chrono::milliseconds(60000);
+            p.connect_timeout = std::chrono::milliseconds(20000);
+            return p;
+        }
+
+        /**
+         * @brief Returns a preset profile optimized for low bandwidth / metered connections (e.g. cellular 3G).
+         */
+        static ConnectionProfile LowBandwidth()
+        {
+            ConnectionProfile p;
+            p.no_delay = false; // Enable Nagle algorithm to merge small packets
+            p.socket_recv_buffer_size = 16 * 1024;
+            p.socket_send_buffer_size = 16 * 1024;
+            p.recv_buffer_size = 1024; // Small read buffer to prevent bufferbloat
+            p.send_chunk_size = 1024;
+            p.max_outbound_buffer_size = 512 * 1024; // Limit queue memory
+            p.idle_timeout = std::chrono::milliseconds(180000);
+            p.send_timeout = std::chrono::milliseconds(120000);
+            p.connect_timeout = std::chrono::milliseconds(30000);
+            p.keepalive_idle_secs = 120; // Heartbeat less frequently
+            p.keepalive_interval_secs = 20;
+            p.keepalive_count = 6;
+            return p;
+        }
+
+        /**
+         * @brief Returns a preset profile optimized for reliable, high-speed, low latency local area networks.
+         */
+        static ConnectionProfile ReliableLAN()
+        {
+            ConnectionProfile p;
+            p.no_delay = true;
+            p.socket_recv_buffer_size = 64 * 1024;
+            p.socket_send_buffer_size = 64 * 1024;
+            p.recv_buffer_size = 8192;
+            p.send_chunk_size = 16384;
+            p.idle_timeout = std::chrono::milliseconds(15000);
+            p.send_timeout = std::chrono::milliseconds(5000);
+            p.connect_timeout = std::chrono::milliseconds(3000);
+            return p;
+        }
     };
 
     /**
@@ -703,6 +981,8 @@ namespace cpptcpnet
         void SetNoDelay(bool enabled)
         {
             no_delay_ = enabled;
+            std::lock_guard<std::mutex> lock(poll_mutex_);
+            default_profile_.no_delay = enabled;
         }
 
         bool GetNoDelay() const
@@ -713,6 +993,8 @@ namespace cpptcpnet
         void SetSocketRecvBufferSize(int size)
         {
             socket_recv_buffer_size_ = size;
+            std::lock_guard<std::mutex> lock(poll_mutex_);
+            default_profile_.socket_recv_buffer_size = size;
         }
 
         int GetSocketRecvBufferSize() const
@@ -723,6 +1005,8 @@ namespace cpptcpnet
         void SetSocketSendBufferSize(int size)
         {
             socket_send_buffer_size_ = size;
+            std::lock_guard<std::mutex> lock(poll_mutex_);
+            default_profile_.socket_send_buffer_size = size;
         }
 
         int GetSocketSendBufferSize() const
@@ -736,6 +1020,11 @@ namespace cpptcpnet
             keepalive_idle_secs_ = config.idle_secs;
             keepalive_interval_secs_ = config.interval_secs;
             keepalive_count_ = config.count;
+            std::lock_guard<std::mutex> lock(poll_mutex_);
+            default_profile_.keepalive_enabled = config.enabled;
+            default_profile_.keepalive_idle_secs = config.idle_secs;
+            default_profile_.keepalive_interval_secs = config.interval_secs;
+            default_profile_.keepalive_count = config.count;
         }
 
         KeepAliveConfig GetKeepAliveConfig() const
@@ -752,6 +1041,9 @@ namespace cpptcpnet
         {
             linger_enabled_ = enabled;
             linger_timeout_secs_ = timeout_secs;
+            std::lock_guard<std::mutex> lock(poll_mutex_);
+            default_profile_.linger_enabled = enabled;
+            default_profile_.linger_timeout_secs = timeout_secs;
         }
 
         LingerConfig GetLinger() const
@@ -810,6 +1102,8 @@ namespace cpptcpnet
         void SetRecvBufferSize(size_t size)
         {
             recv_buffer_size_ = size;
+            std::lock_guard<std::mutex> lock(poll_mutex_);
+            default_profile_.recv_buffer_size = size;
         }
 
         size_t GetRecvBufferSize() const
@@ -820,6 +1114,8 @@ namespace cpptcpnet
         void SetSendChunkSize(size_t size)
         {
             send_chunk_size_ = size;
+            std::lock_guard<std::mutex> lock(poll_mutex_);
+            default_profile_.send_chunk_size = size;
         }
 
         size_t GetSendChunkSize() const
@@ -872,6 +1168,8 @@ namespace cpptcpnet
         void SetIdleTimeout(std::chrono::milliseconds timeout)
         {
             idle_timeout_ms_.store(static_cast<uint32_t>(timeout.count()), std::memory_order_relaxed);
+            std::lock_guard<std::mutex> lock(poll_mutex_);
+            default_profile_.idle_timeout = timeout;
         }
 
         /**
@@ -890,6 +1188,8 @@ namespace cpptcpnet
         void SetSendTimeout(std::chrono::milliseconds timeout)
         {
             send_timeout_ms_.store(static_cast<uint32_t>(timeout.count()), std::memory_order_relaxed);
+            std::lock_guard<std::mutex> lock(poll_mutex_);
+            default_profile_.send_timeout = timeout;
         }
 
         /**
@@ -920,6 +1220,80 @@ namespace cpptcpnet
         }
 
         /**
+         * @brief Sets the default connection profile for new connections.
+         */
+        void SetDefaultConnectionProfile(const ConnectionProfile &profile)
+        {
+            std::lock_guard<std::mutex> lock(poll_mutex_);
+            default_profile_ = profile;
+            // Synchronize individual atomic legacy variables
+            no_delay_.store(profile.no_delay, std::memory_order_relaxed);
+            socket_recv_buffer_size_.store(profile.socket_recv_buffer_size, std::memory_order_relaxed);
+            socket_send_buffer_size_.store(profile.socket_send_buffer_size, std::memory_order_relaxed);
+            keepalive_enabled_.store(profile.keepalive_enabled, std::memory_order_relaxed);
+            keepalive_idle_secs_.store(profile.keepalive_idle_secs, std::memory_order_relaxed);
+            keepalive_interval_secs_.store(profile.keepalive_interval_secs, std::memory_order_relaxed);
+            keepalive_count_.store(profile.keepalive_count, std::memory_order_relaxed);
+            linger_enabled_.store(profile.linger_enabled, std::memory_order_relaxed);
+            linger_timeout_secs_.store(profile.linger_timeout_secs, std::memory_order_relaxed);
+            recv_buffer_size_.store(profile.recv_buffer_size, std::memory_order_relaxed);
+            send_chunk_size_.store(profile.send_chunk_size, std::memory_order_relaxed);
+            max_outbound_buffer_size_.store(profile.max_outbound_buffer_size, std::memory_order_relaxed);
+            idle_timeout_ms_.store(static_cast<uint32_t>(profile.idle_timeout.count()), std::memory_order_relaxed);
+            send_timeout_ms_.store(static_cast<uint32_t>(profile.send_timeout.count()), std::memory_order_relaxed);
+        }
+
+        /**
+         * @brief Gets the default connection profile.
+         */
+        ConnectionProfile GetDefaultConnectionProfile() const
+        {
+            std::lock_guard<std::mutex> lock(poll_mutex_);
+            return default_profile_;
+        }
+
+        /**
+         * @brief Applies a connection profile to an active session dynamically on-the-fly.
+         */
+        void ApplyConnectionProfile(uint64_t session_id, const ConnectionProfile &profile)
+        {
+            socket_t fd = INVALID_SOCKET;
+            {
+                std::lock_guard<std::mutex> lock(poll_mutex_);
+                auto it = session_to_fd_.find(session_id);
+                if (it == session_to_fd_.end())
+                {
+                    throw std::runtime_error("Session not found: " + std::to_string(session_id));
+                }
+                fd = it->second;
+                socket_profiles_[fd] = profile;
+            }
+            if (fd != INVALID_SOCKET)
+            {
+                internal::ApplySocketOptions(fd, profile.ToSocketOptions());
+            }
+        }
+
+        /**
+         * @brief Gets the active connection profile of a specific session.
+         */
+        ConnectionProfile GetConnectionProfile(uint64_t session_id) const
+        {
+            std::lock_guard<std::mutex> lock(poll_mutex_);
+            auto it = session_to_fd_.find(session_id);
+            if (it == session_to_fd_.end())
+            {
+                throw std::runtime_error("Session not found: " + std::to_string(session_id));
+            }
+            auto prof_it = socket_profiles_.find(it->second);
+            if (prof_it != socket_profiles_.end())
+            {
+                return prof_it->second;
+            }
+            return default_profile_;
+        }
+
+        /**
          * @brief Retrieves the PubSub event broker for socket state changes.
          * @return A reference to the PubSub broker.
          */
@@ -935,6 +1309,8 @@ namespace cpptcpnet
         void SetMaxOutboundBufferSize(size_t max_size)
         {
             max_outbound_buffer_size_.store(max_size, std::memory_order_relaxed);
+            std::lock_guard<std::mutex> lock(poll_mutex_);
+            default_profile_.max_outbound_buffer_size = max_size;
         }
 
         /**
@@ -1202,7 +1578,7 @@ namespace cpptcpnet
                     std::lock_guard<std::mutex> out_lock(outbound_mutex_);
                     for (const auto &pair : outbound_buffers_)
                     {
-                        if (pair.second.offset < pair.second.data.size())
+                        if (pair.second.total_bytes > 0)
                         {
                             all_drained = false;
                             break;
@@ -1359,59 +1735,32 @@ namespace cpptcpnet
          */
         bool Send(uint64_t session_id, const std::vector<uint8_t> &response)
         {
-            std::lock_guard<std::mutex> poll_lock(poll_mutex_);
-            auto it = session_to_fd_.find(session_id);
-            if (it == session_to_fd_.end())
-            {
-                Log(LogSeverity::Warning, "TcpListener", "Send called on inactive or stale session_id: " + std::to_string(session_id));
-                return false;
-            }
-            socket_t client_fd = it->second;
-
-            {
-                std::lock_guard<std::mutex> out_lock(outbound_mutex_);
-                auto &out_buf = outbound_buffers_[client_fd];
-                size_t remaining = out_buf.data.size() - out_buf.offset;
-                if (remaining + response.size() > max_outbound_buffer_size_)
-                {
-                    Log(LogSeverity::Error, "TcpListener", "Outbound buffer limit reached for socket fd: " + std::to_string(client_fd) + ". Dropping data.");
-                    return false;
-                }
-                out_buf.data.insert(out_buf.data.end(), response.begin(), response.end());
-            }
-
-            bool is_handshaking = false;
-#ifdef CPPTCPNET_SSL_SUPPORT
-            if (ssl_enabled_)
-            {
-                is_handshaking = ssl_handshaking_fds_.find(client_fd) != ssl_handshaking_fds_.end();
-            }
-#endif
-            if (!is_handshaking)
-            {
-                for (auto &pfd : poll_fds_)
-                {
-                    if (pfd.fd == client_fd)
-                    {
-                        pfd.events |= POLLOUT;
-                        break;
-                    }
-                }
-            }
-            wakeup_channel_.Trigger();
-            return true;
+            return SendImpl(session_id, response);
         }
 
-        /**
-         * @brief Sends string data to a connected client using its session ID.
-         * @param session_id The unique session ID of the client connection.
-         * @param response The string payload to send.
-         * @return True if successfully queued, false otherwise.
-         */
         bool Send(uint64_t session_id, const std::string &response)
         {
-            std::vector<uint8_t> vec(response.begin(), response.end());
-            return Send(session_id, vec);
+            return SendImpl(session_id, response);
+        }
+
+        bool Send(uint64_t session_id, std::vector<uint8_t> &&response)
+        {
+            return SendImpl(session_id, std::move(response));
+        }
+
+        bool Send(uint64_t session_id, std::string &&response)
+        {
+            return SendImpl(session_id, std::move(response));
+        }
+
+        bool Send(uint64_t session_id, std::shared_ptr<const std::vector<uint8_t>> response)
+        {
+            return SendImpl(session_id, std::move(response));
+        }
+
+        bool Send(uint64_t session_id, std::shared_ptr<const std::string> response)
+        {
+            return SendImpl(session_id, std::move(response));
         }
 
         /**
@@ -1444,12 +1793,61 @@ namespace cpptcpnet
         // Lock ordering convention: Always acquire poll_mutex_ BEFORE outbound_mutex_ to prevent deadlocks.
         mutable std::mutex poll_mutex_;
 
-        struct OutboundBuffer
+        template <typename T>
+        bool SendImpl(uint64_t session_id, T &&payload)
         {
-            std::vector<uint8_t> data;
-            size_t offset = 0;
-        };
-        std::unordered_map<socket_t, OutboundBuffer> outbound_buffers_;
+            size_t payload_size = internal::GetDataSize(payload);
+            if (payload_size == 0)
+            {
+                return true;
+            }
+
+            std::lock_guard<std::mutex> poll_lock(poll_mutex_);
+            auto it = session_to_fd_.find(session_id);
+            if (it == session_to_fd_.end())
+            {
+                Log(LogSeverity::Warning, "TcpListener", "Send called on inactive or stale session_id: " + std::to_string(session_id));
+                return false;
+            }
+            socket_t client_fd = it->second;
+            auto prof_it = socket_profiles_.find(client_fd);
+            ConnectionProfile prof = (prof_it != socket_profiles_.end()) ? prof_it->second : default_profile_;
+
+            {
+                std::lock_guard<std::mutex> out_lock(outbound_mutex_);
+                auto &out_buf = outbound_buffers_[client_fd];
+                if (out_buf.total_bytes + payload_size > prof.max_outbound_buffer_size)
+                {
+                    Log(LogSeverity::Error, "TcpListener", "Outbound buffer limit reached for socket fd: " + std::to_string(client_fd) + ". Dropping data.");
+                    return false;
+                }
+                out_buf.chunks.emplace_back(internal::OutboundChunk{std::forward<T>(payload), 0});
+                out_buf.total_bytes += payload_size;
+            }
+
+            bool is_handshaking = false;
+#ifdef CPPTCPNET_SSL_SUPPORT
+            if (ssl_enabled_)
+            {
+                is_handshaking = ssl_handshaking_fds_.find(client_fd) != ssl_handshaking_fds_.end();
+            }
+#endif
+            if (!is_handshaking)
+            {
+                for (auto &pfd : poll_fds_)
+                {
+                    if (pfd.fd == client_fd)
+                    {
+                        pfd.events |= POLLOUT;
+                        break;
+                    }
+                }
+            }
+            wakeup_channel_.Trigger();
+            return true;
+        }
+
+        std::unordered_map<socket_t, internal::OutboundBuffer> outbound_buffers_;
         // Lock ordering convention: Always acquire poll_mutex_ BEFORE outbound_mutex_ to prevent deadlocks.
         std::mutex outbound_mutex_;
         std::atomic<size_t> max_outbound_buffer_size_ = 10 * 1024 * 1024; // 10MB default
@@ -1502,6 +1900,9 @@ namespace cpptcpnet
         std::unordered_set<socket_t> ssl_write_wants_write_;
 #endif
 
+        ConnectionProfile default_profile_;
+        std::unordered_map<socket_t, ConnectionProfile> socket_profiles_;
+
         std::atomic<bool> no_delay_{false};
         std::atomic<int> socket_recv_buffer_size_{0};
         std::atomic<int> socket_send_buffer_size_{0};
@@ -1516,99 +1917,10 @@ namespace cpptcpnet
 
         void ApplySocketOptions(socket_t fd)
         {
-            if (no_delay_.load(std::memory_order_relaxed))
-            {
-                int opt = 1;
-#ifdef _WIN32
-                setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, reinterpret_cast<const char *>(&opt), sizeof(opt));
-#else
-                setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &opt, sizeof(opt));
-#endif
-            }
-
-            int rcv_buf = socket_recv_buffer_size_.load(std::memory_order_relaxed);
-            if (rcv_buf > 0)
-            {
-#ifdef _WIN32
-                setsockopt(fd, SOL_SOCKET, SO_RCVBUF, reinterpret_cast<const char *>(&rcv_buf), sizeof(rcv_buf));
-#else
-                setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &rcv_buf, sizeof(rcv_buf));
-#endif
-            }
-
-            int snd_buf = socket_send_buffer_size_.load(std::memory_order_relaxed);
-            if (snd_buf > 0)
-            {
-#ifdef _WIN32
-                setsockopt(fd, SOL_SOCKET, SO_SNDBUF, reinterpret_cast<const char *>(&snd_buf), sizeof(snd_buf));
-#else
-                setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &snd_buf, sizeof(snd_buf));
-#endif
-            }
-
-            if (keepalive_enabled_.load(std::memory_order_relaxed))
-            {
-                int opt = 1;
-#ifdef _WIN32
-                setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, reinterpret_cast<const char *>(&opt), sizeof(opt));
-#else
-                setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &opt, sizeof(opt));
-#endif
-                int idle = keepalive_idle_secs_.load(std::memory_order_relaxed);
-                int interval = keepalive_interval_secs_.load(std::memory_order_relaxed);
-                int count = keepalive_count_.load(std::memory_order_relaxed);
-
-#ifdef _WIN32
-                if (idle > 0 || interval > 0)
-                {
-                    struct tcp_keepalive vals;
-                    vals.onoff = 1;
-                    vals.keepalivetime = (idle > 0) ? (idle * 1000) : 7200000;
-                    vals.keepaliveinterval = (interval > 0) ? (interval * 1000) : 1000;
-                    DWORD bytes_returned = 0;
-                    WSAIoctl(fd, SIO_KEEPALIVE_VALS, &vals, sizeof(vals), nullptr, 0, &bytes_returned, nullptr, nullptr);
-                }
-#elif defined(__linux__)
-                if (idle > 0)
-                {
-                    setsockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE, &idle, sizeof(idle));
-                }
-                if (interval > 0)
-                {
-                    setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL, &interval, sizeof(interval));
-                }
-                if (count > 0)
-                {
-                    setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT, &count, sizeof(count));
-                }
-#elif defined(__APPLE__)
-                if (idle > 0)
-                {
-                    setsockopt(fd, IPPROTO_TCP, TCP_KEEPALIVE, &idle, sizeof(idle));
-                }
-#endif
-            }
-            else
-            {
-                int opt = 0;
-#ifdef _WIN32
-                setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, reinterpret_cast<const char *>(&opt), sizeof(opt));
-#else
-                setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &opt, sizeof(opt));
-#endif
-            }
-
-            if (linger_enabled_.load(std::memory_order_relaxed))
-            {
-                struct linger so_linger;
-                so_linger.l_onoff = 1;
-                so_linger.l_linger = linger_timeout_secs_.load(std::memory_order_relaxed);
-#ifdef _WIN32
-                setsockopt(fd, SOL_SOCKET, SO_LINGER, reinterpret_cast<const char *>(&so_linger), sizeof(so_linger));
-#else
-                setsockopt(fd, SOL_SOCKET, SO_LINGER, &so_linger, sizeof(so_linger));
-#endif
-            }
+            // Assumes poll_mutex_ is held
+            auto it = socket_profiles_.find(fd);
+            ConnectionProfile prof = (it != socket_profiles_.end()) ? it->second : default_profile_;
+            internal::ApplySocketOptions(fd, prof.ToSocketOptions());
         }
 
         void ReportError(int error_code, const std::string &message)
@@ -1706,15 +2018,16 @@ namespace cpptcpnet
                 {
                     std::lock_guard<std::mutex> lock(poll_mutex_);
                     auto now = std::chrono::steady_clock::now();
-                    auto timeout_duration = std::chrono::milliseconds(idle_timeout_ms_.load(std::memory_order_relaxed));
-                    if (timeout_duration.count() > 0)
+                    for (const auto &pair : last_activity_time_)
                     {
-                        for (const auto &pair : last_activity_time_)
+                        socket_t fd = pair.first;
+                        auto prof_it = socket_profiles_.find(fd);
+                        auto timeout_duration = (prof_it != socket_profiles_.end())
+                                                    ? prof_it->second.idle_timeout
+                                                    : std::chrono::milliseconds(idle_timeout_ms_.load(std::memory_order_relaxed));
+                        if (timeout_duration.count() > 0 && now - pair.second > timeout_duration)
                         {
-                            if (now - pair.second > timeout_duration)
-                            {
-                                idle_connections.push_back(pair.first);
-                            }
+                            idle_connections.push_back(fd);
                         }
                     }
                 }
@@ -1730,25 +2043,25 @@ namespace cpptcpnet
                     std::lock_guard<std::mutex> lock(poll_mutex_);
                     std::lock_guard<std::mutex> out_lock(outbound_mutex_);
                     auto now = std::chrono::steady_clock::now();
-                    auto send_timeout_duration = std::chrono::milliseconds(send_timeout_ms_.load(std::memory_order_relaxed));
-                    if (send_timeout_duration.count() > 0)
+                    for (auto &pair : last_write_time_)
                     {
-                        for (auto &pair : last_write_time_)
+                        socket_t fd = pair.first;
+                        auto it = outbound_buffers_.find(fd);
+                        bool has_pending = (it != outbound_buffers_.end() && it->second.total_bytes > 0);
+                        if (has_pending)
                         {
-                            socket_t fd = pair.first;
-                            auto it = outbound_buffers_.find(fd);
-                            bool has_pending = (it != outbound_buffers_.end() && !it->second.data.empty());
-                            if (has_pending)
+                            auto prof_it = socket_profiles_.find(fd);
+                            auto send_timeout_duration = (prof_it != socket_profiles_.end())
+                                                             ? prof_it->second.send_timeout
+                                                             : std::chrono::milliseconds(send_timeout_ms_.load(std::memory_order_relaxed));
+                            if (send_timeout_duration.count() > 0 && now - pair.second > send_timeout_duration)
                             {
-                                if (now - pair.second > send_timeout_duration)
-                                {
-                                    send_timed_out_connections.push_back(fd);
-                                }
+                                send_timed_out_connections.push_back(fd);
                             }
-                            else
-                            {
-                                pair.second = now;
-                            }
+                        }
+                        else
+                        {
+                            pair.second = now;
                         }
                     }
                 }
@@ -1899,6 +2212,7 @@ namespace cpptcpnet
                         continue;
                     }
 
+                    socket_profiles_[client_fd] = default_profile_;
                     ApplySocketOptions(client_fd);
 
                     do
@@ -2034,7 +2348,7 @@ namespace cpptcpnet
                 {
                     std::lock_guard<std::mutex> out_lock(outbound_mutex_);
                     auto it = outbound_buffers_.find(client_fd);
-                    if (it != outbound_buffers_.end() && !it->second.data.empty())
+                    if (it != outbound_buffers_.end() && it->second.total_bytes > 0)
                     {
                         needs_pollout = true;
                     }
@@ -2061,6 +2375,7 @@ namespace cpptcpnet
             bool disconnect = false;
 
             uint64_t session_id = 0;
+            ConnectionProfile prof;
             {
                 std::lock_guard<std::mutex> lock(poll_mutex_);
                 auto it = fd_to_session_.find(client_fd);
@@ -2068,6 +2383,8 @@ namespace cpptcpnet
                 {
                     session_id = it->second;
                 }
+                auto prof_it = socket_profiles_.find(client_fd);
+                prof = (prof_it != socket_profiles_.end()) ? prof_it->second : default_profile_;
             }
 
 #ifdef CPPTCPNET_SSL_SUPPORT
@@ -2127,7 +2444,7 @@ namespace cpptcpnet
                     bool read_more = true;
                     while (read_more && !disconnect && running_)
                     {
-                        size_t buf_size = recv_buffer_size_.load(std::memory_order_relaxed);
+                        size_t buf_size = prof.recv_buffer_size;
                         std::vector<char> dynamic_buf;
                         char stack_buf[4096];
                         char *buffer = stack_buf;
@@ -2218,6 +2535,7 @@ namespace cpptcpnet
                     }
                 }
 
+                size_t sent_bytes_to_publish = 0;
                 if (!disconnect && should_write)
                 {
                     std::lock_guard<std::mutex> poll_lock(poll_mutex_);
@@ -2226,16 +2544,17 @@ namespace cpptcpnet
                     if (it != outbound_buffers_.end())
                     {
                         auto &out_buf = it->second;
-                        size_t remaining = out_buf.data.size() - out_buf.offset;
-                        if (remaining > 0)
+                        if (out_buf.total_bytes > 0)
                         {
-                            size_t to_send = (std::min)(remaining, send_chunk_size_.load(std::memory_order_relaxed));
+                            auto &chunk = out_buf.chunks.front();
+                            size_t remaining = chunk.remaining();
+                            size_t to_send = (std::min)(remaining, prof.send_chunk_size);
                             int sent = 0;
                             int err = 0;
                             while (running_)
                             {
-                                sent = SSL_write(ssl, out_buf.data.data() + out_buf.offset, static_cast<int>(to_send));
-                                if (sent >= 0)
+                                sent = SSL_write(ssl, chunk.ptr(), static_cast<int>(to_send));
+                                if (sent > 0)
                                     break;
                                 err = SSL_get_error(ssl, sent);
                                 if (err == SSL_ERROR_SYSCALL && GET_SOCKET_ERROR == INTR_ERROR)
@@ -2249,19 +2568,14 @@ namespace cpptcpnet
                                 ssl_write_wants_write_.erase(client_fd);
                                 bytes_sent_.fetch_add(sent, std::memory_order_relaxed);
                                 packets_sent_.fetch_add(1, std::memory_order_relaxed);
-                                broker_.Publish("transfer_events", TransferEvent{session_id, static_cast<size_t>(sent), true});
+                                sent_bytes_to_publish = static_cast<size_t>(sent);
                                 last_activity_time_[client_fd] = std::chrono::steady_clock::now();
                                 last_write_time_[client_fd] = std::chrono::steady_clock::now();
-                                out_buf.offset += sent;
-                                if (out_buf.offset == out_buf.data.size())
+                                chunk.offset += sent;
+                                out_buf.total_bytes -= sent;
+                                if (chunk.offset == chunk.size())
                                 {
-                                    out_buf.data.clear();
-                                    out_buf.offset = 0;
-                                }
-                                else if (out_buf.offset > send_chunk_size_.load(std::memory_order_relaxed))
-                                {
-                                    out_buf.data.erase(out_buf.data.begin(), out_buf.data.begin() + out_buf.offset);
-                                    out_buf.offset = 0;
+                                    out_buf.chunks.pop_front();
                                 }
                             }
                             else
@@ -2283,11 +2597,15 @@ namespace cpptcpnet
                             }
                         }
 
-                        if (out_buf.data.empty() && ssl_write_wants_write_.find(client_fd) == ssl_write_wants_write_.end())
+                        if (out_buf.total_bytes == 0 && ssl_write_wants_write_.find(client_fd) == ssl_write_wants_write_.end())
                         {
                             last_write_time_[client_fd] = std::chrono::steady_clock::now();
                         }
                     }
+                }
+                if (sent_bytes_to_publish > 0)
+                {
+                    broker_.Publish("transfer_events", TransferEvent{session_id, sent_bytes_to_publish, true});
                 }
 
                 if (!disconnect)
@@ -2302,7 +2620,7 @@ namespace cpptcpnet
                             {
                                 std::lock_guard<std::mutex> out_lock(outbound_mutex_);
                                 auto it = outbound_buffers_.find(client_fd);
-                                if (it != outbound_buffers_.end() && !it->second.data.empty())
+                                if (it != outbound_buffers_.end() && it->second.total_bytes > 0)
                                 {
                                     has_outbound = true;
                                 }
@@ -2337,7 +2655,7 @@ namespace cpptcpnet
 
             if (pfd.revents & POLLIN)
             {
-                size_t buf_size = recv_buffer_size_.load(std::memory_order_relaxed);
+                size_t buf_size = prof.recv_buffer_size;
                 std::vector<char> dynamic_buf;
                 char stack_buf[4096];
                 char *buffer = stack_buf;
@@ -2401,6 +2719,7 @@ namespace cpptcpnet
                 }
             }
 
+            size_t sent_bytes_to_publish = 0;
             if (!disconnect && (pfd.revents & POLLOUT))
             {
                 std::lock_guard<std::mutex> poll_lock(poll_mutex_);
@@ -2409,33 +2728,29 @@ namespace cpptcpnet
                 if (it != outbound_buffers_.end())
                 {
                     auto &out_buf = it->second;
-                    size_t remaining = out_buf.data.size() - out_buf.offset;
-                    if (remaining > 0)
+                    if (out_buf.total_bytes > 0)
                     {
-                        size_t to_send = (std::min)(remaining, send_chunk_size_.load(std::memory_order_relaxed));
+                        auto &chunk = out_buf.chunks.front();
+                        size_t remaining = chunk.remaining();
+                        size_t to_send = (std::min)(remaining, prof.send_chunk_size);
                         ssize_t sent;
                         do
                         {
-                            sent = send(client_fd, reinterpret_cast<const char *>(out_buf.data.data() + out_buf.offset), static_cast<socket_buf_size_t>(to_send), SEND_FLAGS);
+                            sent = send(client_fd, reinterpret_cast<const char *>(chunk.ptr()), static_cast<socket_buf_size_t>(to_send), SEND_FLAGS);
                         } while (sent < 0 && GetLastSocketError() == INTR_ERROR && running_);
 
                         if (sent > 0)
                         {
                             bytes_sent_.fetch_add(sent, std::memory_order_relaxed);
                             packets_sent_.fetch_add(1, std::memory_order_relaxed);
-                            broker_.Publish("transfer_events", TransferEvent{session_id, static_cast<size_t>(sent), true});
+                            sent_bytes_to_publish = static_cast<size_t>(sent);
                             last_activity_time_[client_fd] = std::chrono::steady_clock::now();
                             last_write_time_[client_fd] = std::chrono::steady_clock::now();
-                            out_buf.offset += sent;
-                            if (out_buf.offset == out_buf.data.size())
+                            chunk.offset += sent;
+                            out_buf.total_bytes -= sent;
+                            if (chunk.offset == chunk.size())
                             {
-                                out_buf.data.clear();
-                                out_buf.offset = 0;
-                            }
-                            else if (out_buf.offset > send_chunk_size_.load(std::memory_order_relaxed))
-                            {
-                                out_buf.data.erase(out_buf.data.begin(), out_buf.data.begin() + out_buf.offset);
-                                out_buf.offset = 0;
+                                out_buf.chunks.pop_front();
                             }
                         }
                         else if (sent < 0)
@@ -2447,7 +2762,7 @@ namespace cpptcpnet
                         }
                     }
 
-                    if (out_buf.data.empty())
+                    if (out_buf.total_bytes == 0)
                     {
                         last_write_time_[client_fd] = std::chrono::steady_clock::now();
                         for (auto &master_pfd : poll_fds_)
@@ -2460,17 +2775,10 @@ namespace cpptcpnet
                         }
                     }
                 }
-                else
-                {
-                    for (auto &master_pfd : poll_fds_)
-                    {
-                        if (master_pfd.fd == client_fd)
-                        {
-                            master_pfd.events &= ~POLLOUT;
-                            break;
-                        }
-                    }
-                }
+            }
+            if (sent_bytes_to_publish > 0)
+            {
+                broker_.Publish("transfer_events", TransferEvent{session_id, sent_bytes_to_publish, true});
             }
 
             if (!disconnect && (pfd.revents & (POLLERR | POLLHUP)))
@@ -2519,6 +2827,7 @@ namespace cpptcpnet
                     fd_to_session_.erase(it_sess);
                     session_to_fd_.erase(session_id);
                 }
+                socket_profiles_.erase(client_fd);
                 last_activity_time_.erase(client_fd);
                 last_write_time_.erase(client_fd);
                 for (auto it = poll_fds_.begin(); it != poll_fds_.end(); ++it)
@@ -2635,6 +2944,8 @@ namespace cpptcpnet
         void SetNoDelay(bool enabled)
         {
             no_delay_ = enabled;
+            std::lock_guard<std::mutex> lock(poll_mutex_);
+            default_profile_.no_delay = enabled;
         }
 
         bool GetNoDelay() const
@@ -2645,6 +2956,8 @@ namespace cpptcpnet
         void SetSocketRecvBufferSize(int size)
         {
             socket_recv_buffer_size_ = size;
+            std::lock_guard<std::mutex> lock(poll_mutex_);
+            default_profile_.socket_recv_buffer_size = size;
         }
 
         int GetSocketRecvBufferSize() const
@@ -2655,6 +2968,8 @@ namespace cpptcpnet
         void SetSocketSendBufferSize(int size)
         {
             socket_send_buffer_size_ = size;
+            std::lock_guard<std::mutex> lock(poll_mutex_);
+            default_profile_.socket_send_buffer_size = size;
         }
 
         int GetSocketSendBufferSize() const
@@ -2668,6 +2983,11 @@ namespace cpptcpnet
             keepalive_idle_secs_ = config.idle_secs;
             keepalive_interval_secs_ = config.interval_secs;
             keepalive_count_ = config.count;
+            std::lock_guard<std::mutex> lock(poll_mutex_);
+            default_profile_.keepalive_enabled = config.enabled;
+            default_profile_.keepalive_idle_secs = config.idle_secs;
+            default_profile_.keepalive_interval_secs = config.interval_secs;
+            default_profile_.keepalive_count = config.count;
         }
 
         KeepAliveConfig GetKeepAliveConfig() const
@@ -2684,6 +3004,9 @@ namespace cpptcpnet
         {
             linger_enabled_ = enabled;
             linger_timeout_secs_ = timeout_secs;
+            std::lock_guard<std::mutex> lock(poll_mutex_);
+            default_profile_.linger_enabled = enabled;
+            default_profile_.linger_timeout_secs = timeout_secs;
         }
 
         LingerConfig GetLinger() const
@@ -2712,6 +3035,8 @@ namespace cpptcpnet
         void SetRecvBufferSize(size_t size)
         {
             recv_buffer_size_ = size;
+            std::lock_guard<std::mutex> lock(poll_mutex_);
+            default_profile_.recv_buffer_size = size;
         }
 
         size_t GetRecvBufferSize() const
@@ -2722,6 +3047,8 @@ namespace cpptcpnet
         void SetSendChunkSize(size_t size)
         {
             send_chunk_size_ = size;
+            std::lock_guard<std::mutex> lock(poll_mutex_);
+            default_profile_.send_chunk_size = size;
         }
 
         size_t GetSendChunkSize() const
@@ -2771,6 +3098,8 @@ namespace cpptcpnet
         void SetMaxOutboundBufferSize(size_t max_size)
         {
             max_outbound_buffer_size_.store(max_size, std::memory_order_relaxed);
+            std::lock_guard<std::mutex> lock(poll_mutex_);
+            default_profile_.max_outbound_buffer_size = max_size;
         }
 
         /**
@@ -2799,6 +3128,8 @@ namespace cpptcpnet
         void SetSendTimeout(std::chrono::milliseconds timeout)
         {
             send_timeout_ms_.store(static_cast<uint32_t>(timeout.count()), std::memory_order_relaxed);
+            std::lock_guard<std::mutex> lock(poll_mutex_);
+            default_profile_.send_timeout = timeout;
         }
 
         /**
@@ -2817,6 +3148,8 @@ namespace cpptcpnet
         void SetConnectTimeout(std::chrono::milliseconds timeout)
         {
             connect_timeout_ms_.store(static_cast<uint32_t>(timeout.count()), std::memory_order_relaxed);
+            std::lock_guard<std::mutex> lock(poll_mutex_);
+            default_profile_.connect_timeout = timeout;
         }
 
         /**
@@ -2826,6 +3159,98 @@ namespace cpptcpnet
         std::chrono::milliseconds GetConnectTimeout() const
         {
             return std::chrono::milliseconds(connect_timeout_ms_.load(std::memory_order_relaxed));
+        }
+
+        /**
+         * @brief Sets the default connection profile for new connections.
+         */
+        void SetDefaultConnectionProfile(const ConnectionProfile &profile)
+        {
+            std::lock_guard<std::mutex> lock(poll_mutex_);
+            default_profile_ = profile;
+            // Synchronize individual atomic legacy variables
+            no_delay_.store(profile.no_delay, std::memory_order_relaxed);
+            socket_recv_buffer_size_.store(profile.socket_recv_buffer_size, std::memory_order_relaxed);
+            socket_send_buffer_size_.store(profile.socket_send_buffer_size, std::memory_order_relaxed);
+            keepalive_enabled_.store(profile.keepalive_enabled, std::memory_order_relaxed);
+            keepalive_idle_secs_.store(profile.keepalive_idle_secs, std::memory_order_relaxed);
+            keepalive_interval_secs_.store(profile.keepalive_interval_secs, std::memory_order_relaxed);
+            keepalive_count_.store(profile.keepalive_count, std::memory_order_relaxed);
+            linger_enabled_.store(profile.linger_enabled, std::memory_order_relaxed);
+            linger_timeout_secs_.store(profile.linger_timeout_secs, std::memory_order_relaxed);
+            recv_buffer_size_.store(profile.recv_buffer_size, std::memory_order_relaxed);
+            send_chunk_size_.store(profile.send_chunk_size, std::memory_order_relaxed);
+            max_outbound_buffer_size_.store(profile.max_outbound_buffer_size, std::memory_order_relaxed);
+            idle_timeout_ms_.store(static_cast<uint32_t>(profile.idle_timeout.count()), std::memory_order_relaxed);
+            send_timeout_ms_.store(static_cast<uint32_t>(profile.send_timeout.count()), std::memory_order_relaxed);
+            connect_timeout_ms_.store(static_cast<uint32_t>(profile.connect_timeout.count()), std::memory_order_relaxed);
+        }
+
+        /**
+         * @brief Gets the default connection profile.
+         */
+        ConnectionProfile GetDefaultConnectionProfile() const
+        {
+            std::lock_guard<std::mutex> lock(poll_mutex_);
+            return default_profile_;
+        }
+
+        /**
+         * @brief Applies a connection profile to an active session dynamically on-the-fly.
+         */
+        void ApplyConnectionProfile(uint64_t session_id, const ConnectionProfile &profile)
+        {
+            socket_t fd = INVALID_SOCKET;
+            {
+                std::lock_guard<std::mutex> lock(poll_mutex_);
+                auto it = session_to_fd_.find(session_id);
+                if (it == session_to_fd_.end())
+                {
+                    throw std::runtime_error("Session not found: " + std::to_string(session_id));
+                }
+                fd = it->second;
+                socket_profiles_[fd] = profile;
+            }
+            if (fd != INVALID_SOCKET)
+            {
+                internal::ApplySocketOptions(fd, profile.ToSocketOptions());
+            }
+        }
+
+        /**
+         * @brief Applies a connection profile to the default connection (for single-connection clients).
+         */
+        void ApplyConnectionProfile(const ConnectionProfile &profile)
+        {
+            uint64_t session_id = 0;
+            {
+                std::lock_guard<std::mutex> lock(poll_mutex_);
+                if (session_to_fd_.size() != 1)
+                {
+                    throw std::runtime_error("ApplyConnectionProfile without session_id requires exactly one active connection.");
+                }
+                session_id = session_to_fd_.begin()->first;
+            }
+            ApplyConnectionProfile(session_id, profile);
+        }
+
+        /**
+         * @brief Gets the active connection profile of a specific session.
+         */
+        ConnectionProfile GetConnectionProfile(uint64_t session_id) const
+        {
+            std::lock_guard<std::mutex> lock(poll_mutex_);
+            auto it = session_to_fd_.find(session_id);
+            if (it == session_to_fd_.end())
+            {
+                throw std::runtime_error("Session not found: " + std::to_string(session_id));
+            }
+            auto prof_it = socket_profiles_.find(it->second);
+            if (prof_it != socket_profiles_.end())
+            {
+                return prof_it->second;
+            }
+            return default_profile_;
         }
 
         /**
@@ -2855,7 +3280,7 @@ namespace cpptcpnet
                     std::lock_guard<std::mutex> out_lock(outbound_mutex_);
                     for (const auto &pair : outbound_buffers_)
                     {
-                        if (pair.second.offset < pair.second.data.size())
+                        if (pair.second.total_bytes > 0)
                         {
                             all_drained = false;
                             break;
@@ -3010,7 +3435,11 @@ namespace cpptcpnet
                     continue;
                 }
 
-                ApplySocketOptions(fd);
+                {
+                    std::lock_guard<std::mutex> lock(poll_mutex_);
+                    socket_profiles_[fd] = default_profile_;
+                    ApplySocketOptions(fd);
+                }
 
                 if (!SetNonBlocking(fd))
                 {
@@ -3073,92 +3502,62 @@ namespace cpptcpnet
          */
         bool Send(uint64_t session_id, const std::vector<uint8_t> &request)
         {
-            std::lock_guard<std::mutex> poll_lock(poll_mutex_);
-            auto it = session_to_fd_.find(session_id);
-            if (it == session_to_fd_.end())
-            {
-                Log(LogSeverity::Warning, "TcpClient", "Send called on inactive or stale session_id: " + std::to_string(session_id));
-                return false;
-            }
-            socket_t fd = it->second;
-
-            {
-                std::lock_guard<std::mutex> out_lock(outbound_mutex_);
-                auto &out_buf = outbound_buffers_[fd];
-                size_t remaining = out_buf.data.size() - out_buf.offset;
-                if (remaining + request.size() > max_outbound_buffer_size_)
-                {
-                    Log(LogSeverity::Error, "TcpClient", "Outbound buffer limit reached for socket fd: " + std::to_string(fd) + ". Dropping data.");
-                    return false;
-                }
-                out_buf.data.insert(out_buf.data.end(), request.begin(), request.end());
-            }
-
-            bool is_handshaking = false;
-#ifdef CPPTCPNET_SSL_SUPPORT
-            if (ssl_enabled_)
-            {
-                is_handshaking = ssl_handshaking_fds_.find(fd) != ssl_handshaking_fds_.end();
-            }
-#endif
-            if (!is_handshaking)
-            {
-                for (auto &pfd : poll_fds_)
-                {
-                    if (pfd.fd == fd)
-                    {
-                        pfd.events |= POLLOUT;
-                        break;
-                    }
-                }
-            }
-            wakeup_channel_.Trigger();
-            return true;
+            return SendImpl(session_id, request);
         }
 
-        /**
-         * @brief Sends string data to a connected server using its session ID.
-         * @param session_id The unique session ID of the server connection.
-         * @param request The string payload to send.
-         * @return True if successfully queued, false otherwise.
-         */
         bool Send(uint64_t session_id, const std::string &request)
         {
-            std::vector<uint8_t> vec(request.begin(), request.end());
-            return Send(session_id, vec);
+            return SendImpl(session_id, request);
         }
 
-        /**
-         * @brief Sends binary data to the active server connection.
-         * @note Requires exactly one active connection.
-         * @param request The data payload to send.
-         * @return True if successfully queued, false otherwise.
-         */
+        bool Send(uint64_t session_id, std::vector<uint8_t> &&request)
+        {
+            return SendImpl(session_id, std::move(request));
+        }
+
+        bool Send(uint64_t session_id, std::string &&request)
+        {
+            return SendImpl(session_id, std::move(request));
+        }
+
+        bool Send(uint64_t session_id, std::shared_ptr<const std::vector<uint8_t>> request)
+        {
+            return SendImpl(session_id, std::move(request));
+        }
+
+        bool Send(uint64_t session_id, std::shared_ptr<const std::string> request)
+        {
+            return SendImpl(session_id, std::move(request));
+        }
+
         bool Send(const std::vector<uint8_t> &request)
         {
-            uint64_t session_id = 0;
-            {
-                std::lock_guard<std::mutex> lock(poll_mutex_);
-                if (session_to_fd_.size() != 1)
-                {
-                    Log(LogSeverity::Error, "TcpClient", "Send without session_id requires exactly one active connection.");
-                    return false;
-                }
-                session_id = session_to_fd_.begin()->first;
-            }
-            return Send(session_id, request);
+            return SendNoSessionImpl(request);
         }
 
-        /**
-         * @brief Sends string data to the active server connection.
-         * @note Requires exactly one active connection.
-         * @param request The string payload to send.
-         * @return True if successfully queued, false otherwise.
-         */
         bool Send(const std::string &request)
         {
-            std::vector<uint8_t> vec(request.begin(), request.end());
-            return Send(vec);
+            return SendNoSessionImpl(request);
+        }
+
+        bool Send(std::vector<uint8_t> &&request)
+        {
+            return SendNoSessionImpl(std::move(request));
+        }
+
+        bool Send(std::string &&request)
+        {
+            return SendNoSessionImpl(std::move(request));
+        }
+
+        bool Send(std::shared_ptr<const std::vector<uint8_t>> request)
+        {
+            return SendNoSessionImpl(std::move(request));
+        }
+
+        bool Send(std::shared_ptr<const std::string> request)
+        {
+            return SendNoSessionImpl(std::move(request));
         }
 
         /**
@@ -3253,6 +3652,8 @@ namespace cpptcpnet
         void SetIdleTimeout(std::chrono::milliseconds timeout)
         {
             idle_timeout_ms_.store(static_cast<uint32_t>(timeout.count()), std::memory_order_relaxed);
+            std::lock_guard<std::mutex> lock(poll_mutex_);
+            default_profile_.idle_timeout = timeout;
         }
 
         /**
@@ -3315,7 +3716,9 @@ namespace cpptcpnet
         {
             size_t operator()(const Target &t) const
             {
-                return std::hash<std::string>{}(t.ip) ^ (std::hash<uint16_t>{}(t.port) << 1);
+                size_t seed = std::hash<std::string>{}(t.ip);
+                seed ^= std::hash<uint16_t>{}(t.port) + 0x9e3779b9 + (seed << 6) + (seed >> 2);
+                return seed;
             }
         };
 
@@ -3342,12 +3745,77 @@ namespace cpptcpnet
 
         std::unordered_set<socket_t> connecting_sockets_;
         std::unordered_map<socket_t, std::chrono::steady_clock::time_point> connection_start_times_;
-        struct OutboundBuffer
+        template <typename T>
+        bool SendImpl(uint64_t session_id, T &&payload)
         {
-            std::vector<uint8_t> data;
-            size_t offset = 0;
-        };
-        std::unordered_map<socket_t, OutboundBuffer> outbound_buffers_;
+            size_t payload_size = internal::GetDataSize(payload);
+            if (payload_size == 0)
+            {
+                return true;
+            }
+
+            std::lock_guard<std::mutex> poll_lock(poll_mutex_);
+            auto it = session_to_fd_.find(session_id);
+            if (it == session_to_fd_.end())
+            {
+                Log(LogSeverity::Warning, "TcpClient", "Send called on inactive or stale session_id: " + std::to_string(session_id));
+                return false;
+            }
+            socket_t fd = it->second;
+            auto prof_it = socket_profiles_.find(fd);
+            ConnectionProfile prof = (prof_it != socket_profiles_.end()) ? prof_it->second : default_profile_;
+
+            {
+                std::lock_guard<std::mutex> out_lock(outbound_mutex_);
+                auto &out_buf = outbound_buffers_[fd];
+                if (out_buf.total_bytes + payload_size > prof.max_outbound_buffer_size)
+                {
+                    Log(LogSeverity::Error, "TcpClient", "Outbound buffer limit reached for socket fd: " + std::to_string(fd) + ". Dropping data.");
+                    return false;
+                }
+                out_buf.chunks.emplace_back(internal::OutboundChunk{std::forward<T>(payload), 0});
+                out_buf.total_bytes += payload_size;
+            }
+
+            bool is_handshaking = false;
+#ifdef CPPTCPNET_SSL_SUPPORT
+            if (ssl_enabled_)
+            {
+                is_handshaking = ssl_handshaking_fds_.find(fd) != ssl_handshaking_fds_.end();
+            }
+#endif
+            if (!is_handshaking)
+            {
+                for (auto &pfd : poll_fds_)
+                {
+                    if (pfd.fd == fd)
+                    {
+                        pfd.events |= POLLOUT;
+                        break;
+                    }
+                }
+            }
+            wakeup_channel_.Trigger();
+            return true;
+        }
+
+        template <typename T>
+        bool SendNoSessionImpl(T &&request)
+        {
+            uint64_t session_id = 0;
+            {
+                std::lock_guard<std::mutex> lock(poll_mutex_);
+                if (session_to_fd_.size() != 1)
+                {
+                    Log(LogSeverity::Error, "TcpClient", "Send without session_id requires exactly one active connection.");
+                    return false;
+                }
+                session_id = session_to_fd_.begin()->first;
+            }
+            return Send(session_id, std::forward<T>(request));
+        }
+
+        std::unordered_map<socket_t, internal::OutboundBuffer> outbound_buffers_;
         // Lock ordering convention: Always acquire poll_mutex_ BEFORE outbound_mutex_ to prevent deadlocks.
         std::mutex outbound_mutex_;
         std::atomic<size_t> max_outbound_buffer_size_ = 10 * 1024 * 1024; // 10MB default
@@ -3393,6 +3861,9 @@ namespace cpptcpnet
         std::unordered_set<socket_t> ssl_write_wants_write_;
 #endif
 
+        ConnectionProfile default_profile_;
+        std::unordered_map<socket_t, ConnectionProfile> socket_profiles_;
+
         std::atomic<bool> no_delay_{false};
         std::atomic<int> socket_recv_buffer_size_{0};
         std::atomic<int> socket_send_buffer_size_{0};
@@ -3405,99 +3876,10 @@ namespace cpptcpnet
 
         void ApplySocketOptions(socket_t fd)
         {
-            if (no_delay_.load(std::memory_order_relaxed))
-            {
-                int opt = 1;
-#ifdef _WIN32
-                setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, reinterpret_cast<const char *>(&opt), sizeof(opt));
-#else
-                setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &opt, sizeof(opt));
-#endif
-            }
-
-            int rcv_buf = socket_recv_buffer_size_.load(std::memory_order_relaxed);
-            if (rcv_buf > 0)
-            {
-#ifdef _WIN32
-                setsockopt(fd, SOL_SOCKET, SO_RCVBUF, reinterpret_cast<const char *>(&rcv_buf), sizeof(rcv_buf));
-#else
-                setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &rcv_buf, sizeof(rcv_buf));
-#endif
-            }
-
-            int snd_buf = socket_send_buffer_size_.load(std::memory_order_relaxed);
-            if (snd_buf > 0)
-            {
-#ifdef _WIN32
-                setsockopt(fd, SOL_SOCKET, SO_SNDBUF, reinterpret_cast<const char *>(&snd_buf), sizeof(snd_buf));
-#else
-                setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &snd_buf, sizeof(snd_buf));
-#endif
-            }
-
-            if (keepalive_enabled_.load(std::memory_order_relaxed))
-            {
-                int opt = 1;
-#ifdef _WIN32
-                setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, reinterpret_cast<const char *>(&opt), sizeof(opt));
-#else
-                setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &opt, sizeof(opt));
-#endif
-                int idle = keepalive_idle_secs_.load(std::memory_order_relaxed);
-                int interval = keepalive_interval_secs_.load(std::memory_order_relaxed);
-                int count = keepalive_count_.load(std::memory_order_relaxed);
-
-#ifdef _WIN32
-                if (idle > 0 || interval > 0)
-                {
-                    struct tcp_keepalive vals;
-                    vals.onoff = 1;
-                    vals.keepalivetime = (idle > 0) ? (idle * 1000) : 7200000;
-                    vals.keepaliveinterval = (interval > 0) ? (interval * 1000) : 1000;
-                    DWORD bytes_returned = 0;
-                    WSAIoctl(fd, SIO_KEEPALIVE_VALS, &vals, sizeof(vals), nullptr, 0, &bytes_returned, nullptr, nullptr);
-                }
-#elif defined(__linux__)
-                if (idle > 0)
-                {
-                    setsockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE, &idle, sizeof(idle));
-                }
-                if (interval > 0)
-                {
-                    setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL, &interval, sizeof(interval));
-                }
-                if (count > 0)
-                {
-                    setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT, &count, sizeof(count));
-                }
-#elif defined(__APPLE__)
-                if (idle > 0)
-                {
-                    setsockopt(fd, IPPROTO_TCP, TCP_KEEPALIVE, &idle, sizeof(idle));
-                }
-#endif
-            }
-            else
-            {
-                int opt = 0;
-#ifdef _WIN32
-                setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, reinterpret_cast<const char *>(&opt), sizeof(opt));
-#else
-                setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &opt, sizeof(opt));
-#endif
-            }
-
-            if (linger_enabled_.load(std::memory_order_relaxed))
-            {
-                struct linger so_linger;
-                so_linger.l_onoff = 1;
-                so_linger.l_linger = linger_timeout_secs_.load(std::memory_order_relaxed);
-#ifdef _WIN32
-                setsockopt(fd, SOL_SOCKET, SO_LINGER, reinterpret_cast<const char *>(&so_linger), sizeof(so_linger));
-#else
-                setsockopt(fd, SOL_SOCKET, SO_LINGER, &so_linger, sizeof(so_linger));
-#endif
-            }
+            // Assumes poll_mutex_ is held
+            auto it = socket_profiles_.find(fd);
+            ConnectionProfile prof = (it != socket_profiles_.end()) ? it->second : default_profile_;
+            internal::ApplySocketOptions(fd, prof.ToSocketOptions());
         }
 
         // Assumes lifecycle_mutex_ is held
@@ -3706,15 +4088,16 @@ namespace cpptcpnet
                 {
                     std::lock_guard<std::mutex> lock(poll_mutex_);
                     auto now = std::chrono::steady_clock::now();
-                    auto timeout_duration = std::chrono::milliseconds(idle_timeout_ms_.load(std::memory_order_relaxed));
-                    if (timeout_duration.count() > 0)
+                    for (const auto &pair : last_activity_time_)
                     {
-                        for (const auto &pair : last_activity_time_)
+                        socket_t fd = pair.first;
+                        auto prof_it = socket_profiles_.find(fd);
+                        auto timeout_duration = (prof_it != socket_profiles_.end())
+                                                    ? prof_it->second.idle_timeout
+                                                    : std::chrono::milliseconds(idle_timeout_ms_.load(std::memory_order_relaxed));
+                        if (timeout_duration.count() > 0 && now - pair.second > timeout_duration)
                         {
-                            if (now - pair.second > timeout_duration)
-                            {
-                                idle_connections.push_back(pair.first);
-                            }
+                            idle_connections.push_back(fd);
                         }
                     }
                 }
@@ -3731,29 +4114,29 @@ namespace cpptcpnet
                     std::lock_guard<std::mutex> lock(poll_mutex_);
                     std::lock_guard<std::mutex> out_lock(outbound_mutex_);
                     auto now = std::chrono::steady_clock::now();
-                    auto send_timeout_duration = std::chrono::milliseconds(send_timeout_ms_.load(std::memory_order_relaxed));
-                    if (send_timeout_duration.count() > 0)
+                    for (auto &pair : last_write_time_)
                     {
-                        for (auto &pair : last_write_time_)
+                        socket_t fd = pair.first;
+                        if (connecting_sockets_.find(fd) != connecting_sockets_.end())
                         {
-                            socket_t fd = pair.first;
-                            if (connecting_sockets_.find(fd) != connecting_sockets_.end())
+                            continue; // Don't apply send timeout while connecting
+                        }
+                        auto it = outbound_buffers_.find(fd);
+                        bool has_pending = (it != outbound_buffers_.end() && it->second.total_bytes > 0);
+                        if (has_pending)
+                        {
+                            auto prof_it = socket_profiles_.find(fd);
+                            auto send_timeout_duration = (prof_it != socket_profiles_.end())
+                                                             ? prof_it->second.send_timeout
+                                                             : std::chrono::milliseconds(send_timeout_ms_.load(std::memory_order_relaxed));
+                            if (send_timeout_duration.count() > 0 && now - pair.second > send_timeout_duration)
                             {
-                                continue; // Don't apply send timeout while connecting
+                                send_timed_out_connections.push_back(fd);
                             }
-                            auto it = outbound_buffers_.find(fd);
-                            bool has_pending = (it != outbound_buffers_.end() && !it->second.data.empty());
-                            if (has_pending)
-                            {
-                                if (now - pair.second > send_timeout_duration)
-                                {
-                                    send_timed_out_connections.push_back(fd);
-                                }
-                            }
-                            else
-                            {
-                                pair.second = now;
-                            }
+                        }
+                        else
+                        {
+                            pair.second = now;
                         }
                     }
                 }
@@ -3881,7 +4264,7 @@ namespace cpptcpnet
                 {
                     std::lock_guard<std::mutex> out_lock(outbound_mutex_);
                     auto it = outbound_buffers_.find(fd);
-                    if (it != outbound_buffers_.end() && !it->second.data.empty())
+                    if (it != outbound_buffers_.end() && it->second.total_bytes > 0)
                     {
                         needs_pollout = true;
                     }
@@ -3908,6 +4291,7 @@ namespace cpptcpnet
             bool disconnect = false;
 
             uint64_t session_id = 0;
+            ConnectionProfile prof;
             {
                 std::lock_guard<std::mutex> lock(poll_mutex_);
                 auto it = fd_to_session_.find(fd);
@@ -3915,6 +4299,8 @@ namespace cpptcpnet
                 {
                     session_id = it->second;
                 }
+                auto prof_it = socket_profiles_.find(fd);
+                prof = (prof_it != socket_profiles_.end()) ? prof_it->second : default_profile_;
             }
 
             // Check if it's currently connecting
@@ -3961,6 +4347,7 @@ namespace cpptcpnet
                                 ssl_handshaking_fds_.insert(fd);
                                 ssl_handshake_start_times_[fd] = std::chrono::steady_clock::now();
                                 connecting_sockets_.erase(fd);
+                                connection_start_times_.erase(fd);
                                 last_write_time_[fd] = std::chrono::steady_clock::now();
                                 last_activity_time_[fd] = std::chrono::steady_clock::now();
                                 for (auto &master_pfd : poll_fds_)
@@ -3979,6 +4366,7 @@ namespace cpptcpnet
                         {
                             std::lock_guard<std::mutex> lock(poll_mutex_);
                             connecting_sockets_.erase(fd);
+                            connection_start_times_.erase(fd);
                             last_write_time_[fd] = std::chrono::steady_clock::now();
                             last_activity_time_[fd] = std::chrono::steady_clock::now();
 
@@ -3997,6 +4385,7 @@ namespace cpptcpnet
                     {
                         std::lock_guard<std::mutex> lock(poll_mutex_);
                         connecting_sockets_.erase(fd);
+                        connection_start_times_.erase(fd);
                         last_write_time_[fd] = std::chrono::steady_clock::now();
                         last_activity_time_[fd] = std::chrono::steady_clock::now();
 
@@ -4019,7 +4408,7 @@ namespace cpptcpnet
                         {
                             std::lock_guard<std::mutex> out_lock(outbound_mutex_);
                             auto it = outbound_buffers_.find(fd);
-                            if (it != outbound_buffers_.end() && !it->second.data.empty())
+                            if (it != outbound_buffers_.end() && it->second.total_bytes > 0)
                             {
                                 needs_pollout = true;
                             }
@@ -4094,7 +4483,7 @@ namespace cpptcpnet
                         bool read_more = true;
                         while (read_more && !disconnect && running_)
                         {
-                            size_t buf_size = recv_buffer_size_.load(std::memory_order_relaxed);
+                            size_t buf_size = prof.recv_buffer_size;
                             std::vector<char> dynamic_buf;
                             char stack_buf[4096];
                             char *buffer = stack_buf;
@@ -4181,6 +4570,7 @@ namespace cpptcpnet
                         }
                     }
 
+                    size_t sent_bytes_to_publish = 0;
                     if (!disconnect && should_write)
                     {
                         std::lock_guard<std::mutex> poll_lock(poll_mutex_);
@@ -4189,16 +4579,17 @@ namespace cpptcpnet
                         if (it != outbound_buffers_.end())
                         {
                             auto &out_buf = it->second;
-                            size_t remaining = out_buf.data.size() - out_buf.offset;
-                            if (remaining > 0)
+                            if (out_buf.total_bytes > 0)
                             {
-                                size_t to_send = (std::min)(remaining, send_chunk_size_.load(std::memory_order_relaxed));
+                                auto &chunk = out_buf.chunks.front();
+                                size_t remaining = chunk.remaining();
+                                size_t to_send = (std::min)(remaining, prof.send_chunk_size);
                                 int sent = 0;
                                 int err = 0;
                                 while (running_)
                                 {
-                                    sent = SSL_write(ssl, out_buf.data.data() + out_buf.offset, static_cast<int>(to_send));
-                                    if (sent >= 0)
+                                    sent = SSL_write(ssl, chunk.ptr(), static_cast<int>(to_send));
+                                    if (sent > 0)
                                         break;
                                     err = SSL_get_error(ssl, sent);
                                     if (err == SSL_ERROR_SYSCALL && GET_SOCKET_ERROR == INTR_ERROR)
@@ -4212,19 +4603,14 @@ namespace cpptcpnet
                                     ssl_write_wants_write_.erase(fd);
                                     bytes_sent_.fetch_add(sent, std::memory_order_relaxed);
                                     packets_sent_.fetch_add(1, std::memory_order_relaxed);
-                                    broker_.Publish("transfer_events", TransferEvent{session_id, static_cast<size_t>(sent), true});
+                                    sent_bytes_to_publish = static_cast<size_t>(sent);
                                     last_write_time_[fd] = std::chrono::steady_clock::now();
                                     last_activity_time_[fd] = std::chrono::steady_clock::now();
-                                    out_buf.offset += sent;
-                                    if (out_buf.offset == out_buf.data.size())
+                                    chunk.offset += sent;
+                                    out_buf.total_bytes -= sent;
+                                    if (chunk.offset == chunk.size())
                                     {
-                                        out_buf.data.clear();
-                                        out_buf.offset = 0;
-                                    }
-                                    else if (out_buf.offset > send_chunk_size_.load(std::memory_order_relaxed))
-                                    {
-                                        out_buf.data.erase(out_buf.data.begin(), out_buf.data.begin() + out_buf.offset);
-                                        out_buf.offset = 0;
+                                        out_buf.chunks.pop_front();
                                     }
                                 }
                                 else
@@ -4246,11 +4632,15 @@ namespace cpptcpnet
                                 }
                             }
 
-                            if (out_buf.data.empty() && ssl_write_wants_write_.find(fd) == ssl_write_wants_write_.end())
+                            if (out_buf.total_bytes == 0 && ssl_write_wants_write_.find(fd) == ssl_write_wants_write_.end())
                             {
                                 last_write_time_[fd] = std::chrono::steady_clock::now();
                             }
                         }
+                    }
+                    if (sent_bytes_to_publish > 0)
+                    {
+                        broker_.Publish("transfer_events", TransferEvent{session_id, sent_bytes_to_publish, true});
                     }
 
                     if (!disconnect)
@@ -4265,7 +4655,7 @@ namespace cpptcpnet
                                 {
                                     std::lock_guard<std::mutex> out_lock(outbound_mutex_);
                                     auto it = outbound_buffers_.find(fd);
-                                    if (it != outbound_buffers_.end() && !it->second.data.empty())
+                                    if (it != outbound_buffers_.end() && it->second.total_bytes > 0)
                                     {
                                         has_outbound = true;
                                     }
@@ -4296,7 +4686,7 @@ namespace cpptcpnet
 
                 if (pfd.revents & POLLIN)
                 {
-                    size_t buf_size = recv_buffer_size_.load(std::memory_order_relaxed);
+                    size_t buf_size = prof.recv_buffer_size;
                     std::vector<char> dynamic_buf;
                     char stack_buf[4096];
                     char *buffer = stack_buf;
@@ -4359,6 +4749,7 @@ namespace cpptcpnet
                     }
                 }
 
+                size_t sent_bytes_to_publish = 0;
                 if (!disconnect && (pfd.revents & POLLOUT))
                 {
                     std::lock_guard<std::mutex> poll_lock(poll_mutex_);
@@ -4367,33 +4758,29 @@ namespace cpptcpnet
                     if (it != outbound_buffers_.end())
                     {
                         auto &out_buf = it->second;
-                        size_t remaining = out_buf.data.size() - out_buf.offset;
-                        if (remaining > 0)
+                        if (out_buf.total_bytes > 0)
                         {
-                            size_t to_send = (std::min)(remaining, send_chunk_size_.load(std::memory_order_relaxed));
+                            auto &chunk = out_buf.chunks.front();
+                            size_t remaining = chunk.remaining();
+                            size_t to_send = (std::min)(remaining, prof.send_chunk_size);
                             ssize_t sent;
                             do
                             {
-                                sent = send(fd, reinterpret_cast<const char *>(out_buf.data.data() + out_buf.offset), static_cast<socket_buf_size_t>(to_send), SEND_FLAGS);
+                                sent = send(fd, reinterpret_cast<const char *>(chunk.ptr()), static_cast<socket_buf_size_t>(to_send), SEND_FLAGS);
                             } while (sent < 0 && GetLastSocketError() == INTR_ERROR && running_);
 
                             if (sent > 0)
                             {
                                 bytes_sent_.fetch_add(sent, std::memory_order_relaxed);
                                 packets_sent_.fetch_add(1, std::memory_order_relaxed);
-                                broker_.Publish("transfer_events", TransferEvent{session_id, static_cast<size_t>(sent), true});
+                                sent_bytes_to_publish = static_cast<size_t>(sent);
                                 last_write_time_[fd] = std::chrono::steady_clock::now();
                                 last_activity_time_[fd] = std::chrono::steady_clock::now();
-                                out_buf.offset += sent;
-                                if (out_buf.offset == out_buf.data.size())
+                                chunk.offset += sent;
+                                out_buf.total_bytes -= sent;
+                                if (chunk.offset == chunk.size())
                                 {
-                                    out_buf.data.clear();
-                                    out_buf.offset = 0;
-                                }
-                                else if (out_buf.offset > send_chunk_size_.load(std::memory_order_relaxed))
-                                {
-                                    out_buf.data.erase(out_buf.data.begin(), out_buf.data.begin() + out_buf.offset);
-                                    out_buf.offset = 0;
+                                    out_buf.chunks.pop_front();
                                 }
                             }
                             else if (sent < 0)
@@ -4405,7 +4792,7 @@ namespace cpptcpnet
                             }
                         }
 
-                        if (out_buf.data.empty())
+                        if (out_buf.total_bytes == 0)
                         {
                             last_write_time_[fd] = std::chrono::steady_clock::now();
                             for (auto &master_pfd : poll_fds_)
@@ -4418,17 +4805,10 @@ namespace cpptcpnet
                             }
                         }
                     }
-                    else
-                    {
-                        for (auto &master_pfd : poll_fds_)
-                        {
-                            if (master_pfd.fd == fd)
-                            {
-                                master_pfd.events &= ~POLLOUT;
-                                break;
-                            }
-                        }
-                    }
+                }
+                if (sent_bytes_to_publish > 0)
+                {
+                    broker_.Publish("transfer_events", TransferEvent{session_id, sent_bytes_to_publish, true});
                 }
 
                 if (!disconnect && (pfd.revents & (POLLERR | POLLHUP)))
@@ -4475,6 +4855,7 @@ namespace cpptcpnet
                 std::lock_guard<std::mutex> lock(poll_mutex_);
                 connecting_sockets_.erase(fd);
                 connection_start_times_.erase(fd);
+                socket_profiles_.erase(fd);
                 last_write_time_.erase(fd);
                 last_activity_time_.erase(fd);
 
@@ -4520,7 +4901,7 @@ namespace cpptcpnet
                     reconnecting_targets_.insert(target);
 
                     // Clean up finished reconnect threads first
-                    for (auto it = reconnect_threads_.begin(); it != reconnect_threads_.end(); )
+                    for (auto it = reconnect_threads_.begin(); it != reconnect_threads_.end();)
                     {
                         if ((*it)->finished.load())
                         {
@@ -4538,7 +4919,7 @@ namespace cpptcpnet
 
                     auto info = std::make_shared<ReconnectThreadInfo>();
                     info->thread = std::thread([this, target, info]()
-                                                             {
+                                               {
                         std::chrono::milliseconds current_delay = reconnect_initial_delay_;
                         while (running_) {
                             auto sleep_start = std::chrono::steady_clock::now();
@@ -4594,8 +4975,7 @@ namespace cpptcpnet
 
                         std::lock_guard<std::mutex> lock_state(poll_mutex_);
                         reconnecting_targets_.erase(target);
-                        info->finished.store(true);
-                    });
+                        info->finished.store(true); });
                     reconnect_threads_.push_back(info);
                 }
             }

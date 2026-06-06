@@ -187,6 +187,77 @@ if (server.IsRunning()) {
     }
 }
 ```
+
+## Connection Profiles
+
+To simplify network tuning across various network conditions (such as high latency, low bandwidth, or high-speed local networks), `cpp-tcpnet` provides a profile-based configuration model. Instead of setting multiple individual configuration options, you can pack these options into a `ConnectionProfile` struct and apply it either globally as a default, or dynamically to specific active connections on the fly.
+
+### Profile Presets
+
+`ConnectionProfile` provides three standard static factory functions for common scenarios:
+
+1. **`ConnectionProfile::HighLatency()`**: Optimized for networks with high latency and high bandwidth-delay product (BDP), such as satellite links.
+   - Enforces `no_delay = true`
+   - Configures socket buffer sizes to `512 KB`
+   - Configures application-level receive buffer size to `64 KB`
+   - Increases connection timeouts (e.g. `120s` idle timeout)
+
+2. **`ConnectionProfile::LowBandwidth()`**: Optimized for low bandwidth, high latency, or metered networks like cellular 3G/4G.
+   - Disables `no_delay` (enables Nagle's algorithm) to merge small packets and reduce protocol overhead
+   - Configures socket buffer sizes to `16 KB`
+   - Configures application-level receive buffer size to `1 KB` to prevent bufferbloat
+   - Implements longer idle and keepalive intervals
+
+3. **`ConnectionProfile::ReliableLAN()`**: Optimized for low-latency, high-speed, reliable local area networks.
+   - Enforces `no_delay = true`
+   - Configures socket buffer sizes to `64 KB`
+   - Configures application-level receive buffer size to `8 KB`
+   - Implements short timeouts (e.g. `15s` idle timeout)
+
+### Configuring the Default Profile
+
+You can apply a default profile to `TcpListener` that will be inherited by all newly accepted client sessions. If you call legacy configuration methods (like `.SetNoDelay()`), the default connection profile will be updated automatically in sync.
+
+```cpp
+cpptcpnet::TcpListener server(8080);
+
+// Use a preset
+cpptcpnet::ConnectionProfile profile = cpptcpnet::ConnectionProfile::ReliableLAN();
+
+// Or configure custom settings:
+profile.no_delay = true;
+profile.recv_buffer_size = 9999;
+profile.idle_timeout = std::chrono::seconds(45);
+
+// Set the default profile for all future connections
+server.SetDefaultConnectionProfile(profile);
+
+// Retrieve the default profile
+cpptcpnet::ConnectionProfile current_default = server.GetDefaultConnectionProfile();
+```
+
+### Dynamic Profile Application
+
+You can also dynamically apply a profile on the fly to a specific client connection. This allows your application to change settings based on client type, telemetry, or network conditions without disrupting other connections or restarting the server.
+
+```cpp
+// 1. Get active sessions
+std::vector<uint64_t> sessions = server.GetActiveSessions();
+
+if (!sessions.empty()) {
+    uint64_t target_session = sessions[0];
+
+    // 2. Query the current active profile for this session
+    cpptcpnet::ConnectionProfile current_prof = server.GetConnectionProfile(target_session);
+
+    // 3. Define a new profile (e.g. adjust idle timeout to 200ms)
+    cpptcpnet::ConnectionProfile updated_prof = current_prof;
+    updated_prof.idle_timeout = std::chrono::milliseconds(200);
+
+    // 4. Apply the updated profile dynamically to that connection
+    server.ApplyConnectionProfile(target_session, updated_prof);
+}
+```
  
 ## SSL/TLS Encryption
 

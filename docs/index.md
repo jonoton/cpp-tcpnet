@@ -14,6 +14,8 @@ layout: default
 - **Built-in Thread Pool:** Automatically dispatches incoming packet data to a background worker pool for processing.
 - **Event-Driven:** Uses the `cpp-pubsub` broker to publish events whenever connections connect or disconnect.
 - **Peer Address API:** Retrieve the remote peer's IP address and port for any active session with `GetPeerAddress(session_id)`.
+- **Zero-Copy Transmissions:** Safely bypass memory allocations and data copying during transmission using C++17 move semantics (`std::move`) or shared reference counts (`std::shared_ptr<const T>`).
+- **Dynamic Connection Profiles:** Package socket options and application network configurations into preset or custom `ConnectionProfile` objects and apply them dynamically on the fly per session.
 - **Highly Configurable:** Fine-tune socket options (Nagle's algorithm, keepalives, linger, reuse port), thread pool bounds, outbound buffer limits, dynamically allocated receive buffers, custom cipher suites, TLS version bounds, idle timeouts, and automatic client reconnection with backoff.
 - **Performance Metrics:** Monitor cumulative bytes/packets sent and received, connection counts, calculate real-time throughput using the sliding-window `ThroughputTracker`, and scale raw counts using formatting helpers.
 

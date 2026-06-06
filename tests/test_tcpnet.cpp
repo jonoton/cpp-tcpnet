@@ -743,6 +743,245 @@ TEST(TcpNetFeatureTest, IPv6ConnectAndPeerAddress) {
     listener.Stop();
 }
 
+TEST(TcpNetZeroCopyTest, MoveSendVectorAndString) {
+    cpptcpnet::TcpListener listener(8110);
+    std::atomic<size_t> total_received{0};
+    listener.SetDataHandler([&total_received](uint64_t, const std::vector<uint8_t>& data) {
+        total_received.fetch_add(data.size());
+    });
+    listener.Start();
+
+    cpptcpnet::TcpClient client;
+    client.Start();
+
+    uint64_t session_id = client.Connect("127.0.0.1", 8110);
+    ASSERT_GT(session_id, 0);
+
+    // Wait for connection
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+
+    // Move send vector
+    std::vector<uint8_t> vec_payload = { 'v', 'e', 'c', 't', 'o', 'r' };
+    EXPECT_TRUE(client.Send(std::move(vec_payload)));
+    EXPECT_TRUE(vec_payload.empty()); // verify it was moved
+
+    // Move send string
+    std::string str_payload = "string";
+    EXPECT_TRUE(client.Send(std::move(str_payload)));
+    EXPECT_TRUE(str_payload.empty()); // verify it was moved
+
+    // Wait for delivery
+    for (int i = 0; i < 100 && total_received.load() < 12; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    EXPECT_EQ(total_received.load(), 12);
+
+    client.Stop();
+    listener.Stop();
+}
+
+TEST(TcpNetZeroCopyTest, SharedPtrSendVector) {
+    cpptcpnet::TcpListener listener(8111);
+    std::atomic<size_t> total_received{0};
+    listener.SetDataHandler([&total_received](uint64_t, const std::vector<uint8_t>& data) {
+        total_received.fetch_add(data.size());
+    });
+    listener.Start();
+
+    cpptcpnet::TcpClient client;
+    client.Start();
+
+    uint64_t session_id = client.Connect("127.0.0.1", 8111);
+    ASSERT_GT(session_id, 0);
+
+    // Wait for connection
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+
+    // Shared ptr send vector
+    auto shared_vec = std::make_shared<const std::vector<uint8_t>>(std::vector<uint8_t>{ 's', 'h', 'a', 'r', 'e', 'd', 'v', 'e', 'c' });
+    EXPECT_TRUE(client.Send(shared_vec));
+    EXPECT_EQ(shared_vec.use_count(), 2); // 1 in tests, 1 in client outbound queue
+
+    // Wait for delivery
+    for (int i = 0; i < 100 && total_received.load() < 9; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    EXPECT_EQ(total_received.load(), 9);
+
+    // After socket sends it and is drained, the use count should return to 1
+    // Let's poll for a short time to allow queue to drop it
+    for (int i = 0; i < 50 && shared_vec.use_count() > 1; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    EXPECT_EQ(shared_vec.use_count(), 1);
+
+    client.Stop();
+    listener.Stop();
+}
+
+TEST(TcpNetZeroCopyTest, SharedPtrSendString) {
+    cpptcpnet::TcpListener listener(8112);
+    std::atomic<size_t> total_received{0};
+    listener.SetDataHandler([&total_received](uint64_t, const std::vector<uint8_t>& data) {
+        total_received.fetch_add(data.size());
+    });
+    listener.Start();
+
+    cpptcpnet::TcpClient client;
+    client.Start();
+
+    uint64_t session_id = client.Connect("127.0.0.1", 8112);
+    ASSERT_GT(session_id, 0);
+
+    // Wait for connection
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+
+    // Shared ptr send string
+    auto shared_str = std::make_shared<const std::string>("sharedstring");
+    EXPECT_TRUE(client.Send(shared_str));
+    EXPECT_EQ(shared_str.use_count(), 2); // 1 in tests, 1 in client outbound queue
+
+    // Wait for delivery
+    for (int i = 0; i < 100 && total_received.load() < 12; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    EXPECT_EQ(total_received.load(), 12);
+
+    // After socket sends it and is drained, the use count should return to 1
+    for (int i = 0; i < 50 && shared_str.use_count() > 1; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    EXPECT_EQ(shared_str.use_count(), 1);
+
+    client.Stop();
+    listener.Stop();
+}
+
+// ===== Connection Profile Tests =====
+
+TEST(TcpNetConfigTest, ConnectionProfilePresets) {
+    // High Latency preset verification
+    auto p_high = cpptcpnet::ConnectionProfile::HighLatency();
+    EXPECT_TRUE(p_high.no_delay);
+    EXPECT_EQ(p_high.socket_recv_buffer_size, 512 * 1024);
+    EXPECT_EQ(p_high.socket_send_buffer_size, 512 * 1024);
+    EXPECT_EQ(p_high.recv_buffer_size, 65536);
+    EXPECT_EQ(p_high.idle_timeout.count(), 120000);
+
+    // Low Bandwidth preset verification
+    auto p_low = cpptcpnet::ConnectionProfile::LowBandwidth();
+    EXPECT_FALSE(p_low.no_delay);
+    EXPECT_EQ(p_low.socket_recv_buffer_size, 16 * 1024);
+    EXPECT_EQ(p_low.recv_buffer_size, 1024);
+    EXPECT_EQ(p_low.max_outbound_buffer_size, 512 * 1024);
+    EXPECT_EQ(p_low.keepalive_idle_secs, 120);
+
+    // Reliable LAN preset verification
+    auto p_lan = cpptcpnet::ConnectionProfile::ReliableLAN();
+    EXPECT_TRUE(p_lan.no_delay);
+    EXPECT_EQ(p_lan.socket_recv_buffer_size, 64 * 1024);
+    EXPECT_EQ(p_lan.recv_buffer_size, 8192);
+    EXPECT_EQ(p_lan.idle_timeout.count(), 15000);
+}
+
+TEST(TcpNetConfigTest, SetAndGetProfiles) {
+    cpptcpnet::TcpListener listener(8120);
+    cpptcpnet::ConnectionProfile custom_prof;
+    custom_prof.no_delay = true;
+    custom_prof.recv_buffer_size = 9999;
+    custom_prof.idle_timeout = std::chrono::milliseconds(45000);
+
+    listener.SetDefaultConnectionProfile(custom_prof);
+    auto default_prof = listener.GetDefaultConnectionProfile();
+    EXPECT_TRUE(default_prof.no_delay);
+    EXPECT_EQ(default_prof.recv_buffer_size, 9999);
+    EXPECT_EQ(default_prof.idle_timeout.count(), 45000);
+
+    // Check compatibility setters synced
+    EXPECT_TRUE(listener.GetNoDelay());
+    EXPECT_EQ(listener.GetRecvBufferSize(), 9999);
+    EXPECT_EQ(listener.GetIdleTimeout().count(), 45000);
+
+    listener.Start();
+
+    cpptcpnet::TcpClient client;
+    client.SetDefaultConnectionProfile(custom_prof);
+    client.Start();
+
+    uint64_t session_id = client.Connect("127.0.0.1", 8120);
+    ASSERT_GT(session_id, 0);
+
+    // Wait for connection to establish
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+
+    // Verify connection profile propagation
+    auto client_conn_prof = client.GetConnectionProfile(session_id);
+    EXPECT_EQ(client_conn_prof.recv_buffer_size, 9999);
+
+    auto active_listener_sessions = listener.GetActiveSessions();
+    ASSERT_EQ(active_listener_sessions.size(), 1);
+    uint64_t listener_session_id = active_listener_sessions[0];
+    auto listener_conn_prof = listener.GetConnectionProfile(listener_session_id);
+    EXPECT_EQ(listener_conn_prof.recv_buffer_size, 9999);
+
+    // Apply new profile on the fly per session
+    cpptcpnet::ConnectionProfile on_the_fly_prof;
+    on_the_fly_prof.recv_buffer_size = 12345;
+    on_the_fly_prof.idle_timeout = std::chrono::milliseconds(200);
+
+    client.ApplyConnectionProfile(session_id, on_the_fly_prof);
+    auto client_updated_prof = client.GetConnectionProfile(session_id);
+    EXPECT_EQ(client_updated_prof.recv_buffer_size, 12345);
+
+    listener.ApplyConnectionProfile(listener_session_id, on_the_fly_prof);
+    auto listener_updated_prof = listener.GetConnectionProfile(listener_session_id);
+    EXPECT_EQ(listener_updated_prof.recv_buffer_size, 12345);
+
+    client.Stop();
+    listener.Stop();
+}
+
+TEST(TcpNetConfigTest, ProfileIdleTimeoutEnforcement) {
+    cpptcpnet::TcpListener listener(8121);
+    listener.Start();
+
+    cpptcpnet::TcpClient client;
+    client.Start();
+
+    std::atomic<bool> disconnected{false};
+    cpppubsub::Worker worker;
+    auto sub = client.GetEventBroker().Subscribe<cpptcpnet::ConnectionEvent>("state_events");
+    worker.AddSubscription<cpptcpnet::ConnectionEvent>(sub, [&](const cpptcpnet::ConnectionEvent& e) {
+        if (e.state == cpptcpnet::ConnectionState::Disconnected) {
+            disconnected.store(true);
+        }
+    });
+    worker.Start();
+
+    uint64_t session_id = client.Connect("127.0.0.1", 8121);
+    ASSERT_GT(session_id, 0);
+
+    // Wait for connection to establish
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+    // Apply profile on the fly with a short idle timeout (150ms)
+    cpptcpnet::ConnectionProfile short_timeout_prof;
+    short_timeout_prof.idle_timeout = std::chrono::milliseconds(150);
+
+    client.ApplyConnectionProfile(session_id, short_timeout_prof);
+
+    // Wait for the short idle timeout to trigger disconnect
+    for (int i = 0; i < 100 && !disconnected.load(); ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    EXPECT_TRUE(disconnected.load());
+
+    client.Stop();
+    worker.Stop();
+    listener.Stop();
+}
+
+
 
 
 

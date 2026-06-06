@@ -11,6 +11,8 @@
 - **Built-in Thread Pool:** Automatically dispatches incoming packet data to a background worker pool for concurrent processing.
 - **Event-Driven:** Uses the `cpp-pubsub` broker to publish events whenever connections connect or disconnect.
 - **Peer Address API:** Retrieve the remote peer's IP address and port for any active session with `GetPeerAddress(session_id)`.
+- **Zero-Copy Transmissions:** Safely bypass memory allocations and data copying during transmission using C++17 move semantics (`std::move`) or shared reference counts (`std::shared_ptr<const T>`).
+- **Dynamic Connection Profiles:** Package socket options and application network configurations into preset or custom `ConnectionProfile` objects and apply them dynamically on the fly per session.
 - **Highly Configurable:** Fine-tune socket options (Nagle's algorithm, keepalives, linger, reuse port), thread pool bounds, outbound buffer limits, dynamically allocated receive buffers, custom cipher suites, TLS version bounds, idle timeouts, and automatic client reconnection with backoff.
 - **Performance Metrics:** Monitor cumulative bytes/packets sent and received, connection counts, calculate real-time throughput using the sliding-window `ThroughputTracker`, and scale raw counts using formatting helpers.
 - **Robust Error Handling:** Synchronous setup methods use exceptions (`std::system_error`), while asynchronous background errors are reported via callbacks and PubSub events.
@@ -116,6 +118,48 @@ ka.interval_secs = 10;
 ka.count = 3;
 client.SetKeepAliveConfig(ka);
 ```
+
+## Connection Profiles
+
+To simplify network tuning across different link environments, `cpp-tcpnet` provides a profile-based configuration model. Developers can define preset or custom `ConnectionProfile` settings and apply them to target sessions on the fly without restarting:
+
+```cpp
+// 1. Instantiate a profile using built-in presets or custom settings
+// Presets: ConnectionProfile::HighLatency(), ConnectionProfile::LowBandwidth(), ConnectionProfile::ReliableLAN()
+cpptcpnet::ConnectionProfile profile = cpptcpnet::ConnectionProfile::ReliableLAN();
+profile.idle_timeout = std::chrono::seconds(15);
+profile.recv_buffer_size = 8192; // Customize specific values
+
+// 2. Set default profiles for all future sessions on clients or servers
+server.SetDefaultConnectionProfile(profile);
+client.SetDefaultConnectionProfile(profile);
+
+// 3. Apply profile updates dynamically to active connections
+uint64_t session_id = ...;
+server.ApplyConnectionProfile(session_id, profile);
+client.ApplyConnectionProfile(session_id, profile);
+```
+
+All legacy socket tuning setters (like `SetNoDelay()` and `SetRecvBufferSize()`) remain fully supported and transparently synchronize with the default connection profile.
+
+## Zero-Copy Transmissions
+
+For high-throughput workloads, `cpp-tcpnet` supports zero-copy sending overloads of the `.Send()` method. By utilizing move semantics or reference-counted shared pointers, memory allocations and copy operations are bypassed entirely:
+
+```cpp
+// 1. Move-Based Zero-Copy (takes ownership of container and avoids copies, leaves source empty)
+std::vector<uint8_t> vec_payload = { 'v', 'e', 'c', 't', 'o', 'r' };
+client.Send(std::move(vec_payload)); // vec_payload is now empty
+
+std::string str_payload = "zero copy string";
+client.Send(std::move(str_payload)); // str_payload is now empty
+
+// 2. Shared Pointer-Based Zero-Copy (shares immutable memory between caller and queue)
+auto shared_vec = std::make_shared<const std::vector<uint8_t>>(std::vector<uint8_t>{ 's', 'h', 'a', 'r', 'e', 'd' });
+client.Send(shared_vec); // use_count increments to 2, returns to 1 once fully written to socket
+```
+
+These zero-copy sends are available on both `TcpClient` and `TcpListener`.
 
 ## Documentation
 For full API documentation and advanced usage, please refer to our [GitHub Pages Documentation Site](https://jonoton.github.io/cpp-tcpnet/).

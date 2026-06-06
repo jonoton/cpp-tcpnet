@@ -76,6 +76,45 @@ client.SetErrorHandler([](int error_code, const std::string& message) {
 });
 ```
 
+## Zero-Copy Transmissions
+
+For high-throughput workloads, `cpp-tcpnet` supports zero-copy sending overloads of the `.Send()` method. By default, calling `.Send()` with a `const std::vector<uint8_t>&` or `const std::string&` copies the data into the library's internal outbound queue. The zero-copy overloads avoid memory allocation and copying entirely, utilizing C++17 move semantics or reference-counted shared pointers instead.
+
+These zero-copy methods are available on both `TcpClient` and `TcpListener`.
+
+### 1. Move-Based Zero-Copy (`std::move`)
+
+When you pass an rvalue reference (using `std::move`), the outbound queue takes ownership of the container's internal data array. The original local variable is left empty.
+
+```cpp
+// Moving a vector
+std::vector<uint8_t> payload = { 'D', 'a', 't', 'a' };
+client.Send(std::move(payload)); 
+// payload is now empty; data was transferred to the outbound queue without copying
+
+// Moving a string
+std::string text = "A large text payload...";
+client.Send(std::move(text)); 
+// text is now empty
+```
+
+### 2. Shared Pointer-Based Zero-Copy (`std::shared_ptr`)
+
+If you want to send the same read-only buffer to multiple sessions, or if the caller needs to keep a reference to the data, you can pass a `std::shared_ptr<const std::vector<uint8_t>>` or `std::shared_ptr<const std::string>`.
+
+The outbound queue stores a copy of the `std::shared_ptr`, incrementing its reference count. Once the background polling thread has successfully written all of the chunk's data to the socket, the chunk is popped from the queue and the reference count is decremented.
+
+```cpp
+// Define shared data
+auto shared_payload = std::make_shared<const std::string>("shared immutable content");
+
+// Send to multiple active sessions (or the single client connection)
+client.Send(shared_payload); // use_count increases to 2 (1 in caller, 1 in outbound queue)
+
+// Once the background worker finishes writing it to the socket and drains the queue,
+// the use count automatically decreases back to 1.
+```
+
 ## Client Configuration & Socket Settings
 
 `TcpClient` provides a set of configuration settings to control connection timeouts, socket-level settings, threading pool size, and connection recovery parameters:
@@ -168,6 +207,41 @@ if (client.IsRunning()) {
         client.Disconnect(session_id);
     }
 }
+```
+
+## Connection Profiles
+
+`TcpClient` fully supports the `ConnectionProfile` system. You can configure a client's default connection options, and dynamically modify socket properties on the fly.
+
+### Setting a Default Profile
+
+Setting a default profile applies those network parameters to all future connections initiated by the client:
+
+```cpp
+cpptcpnet::TcpClient client;
+
+// Choose from standard presets: HighLatency(), LowBandwidth(), ReliableLAN()
+cpptcpnet::ConnectionProfile profile = cpptcpnet::ConnectionProfile::HighLatency();
+profile.connect_timeout = std::chrono::seconds(15);
+
+// Set default profile for future connections
+client.SetDefaultConnectionProfile(profile);
+```
+
+### Applying a Profile to Active Connections
+
+You can apply a new profile to an active connection dynamically on the fly. On the client side, if there is exactly one active connection, you can omit the session ID:
+
+```cpp
+// Option A: Apply on the fly to a specific session ID
+uint64_t session_id = ...;
+client.ApplyConnectionProfile(session_id, profile);
+
+// Option B: Apply to the single active connection (throws if multiple connections are active)
+client.ApplyConnectionProfile(profile);
+
+// Retrieve the current profile for a session
+cpptcpnet::ConnectionProfile current_prof = client.GetConnectionProfile(session_id);
 ```
  
 ## SSL/TLS Encryption
