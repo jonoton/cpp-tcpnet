@@ -84,7 +84,7 @@ namespace cpptcpnet
 {
     constexpr int VERSION_MAJOR = 1;
     constexpr int VERSION_MINOR = 2;
-    constexpr int VERSION_PATCH = 0;
+    constexpr int VERSION_PATCH = 1;
 
     /**
      * @brief Returns the library version as a string.
@@ -1084,6 +1084,16 @@ namespace cpptcpnet
             return listen_backlog_;
         }
 
+        /**
+         * @brief Sets the number of background worker threads for handling callbacks.
+         * @param threads The number of background threads.
+         * @note Under the hood, this creates a vector of single-threaded worker pools.
+         *       Incoming data callbacks for any single session are pinned to the same worker
+         *       pool using a hash of the session ID. This guarantees
+         *       session affinity (serial, in-order execution of callbacks for any single session)
+         *       while allowing concurrent processing across different sessions.
+         * @note Must be called before Start(). Not thread-safe to call while the server is running.
+         */
         void SetWorkerThreadCount(size_t threads)
         {
             std::lock_guard<std::mutex> lock(lifecycle_mutex_);
@@ -3027,6 +3037,16 @@ namespace cpptcpnet
             return config;
         }
 
+        /**
+         * @brief Sets the number of background worker threads for handling callbacks.
+         * @param threads The number of background threads.
+         * @note Under the hood, this creates a vector of single-threaded worker pools.
+         *       Incoming data callbacks for any single session are pinned to the same worker
+         *       pool using a hash of the session ID. This guarantees
+         *       session affinity (serial, in-order execution of callbacks for any single session)
+         *       while allowing concurrent processing across different sessions.
+         * @note Must be called before Start(). Not thread-safe to call while the client is running.
+         */
         void SetWorkerThreadCount(size_t threads)
         {
             std::lock_guard<std::mutex> lock(lifecycle_mutex_);

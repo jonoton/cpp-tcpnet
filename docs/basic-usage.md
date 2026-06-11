@@ -147,7 +147,7 @@ server.SetReusePort(true);
 
 ### Backlog & Threading & Buffers
 * **Listen Backlog**: The maximum size of the queue of pending connections.
-* **Worker Thread Count**: The size of the thread pool processing data and error callbacks. If set to 0, automatically defaults to `std::thread::hardware_concurrency()`.
+* **Worker Thread Count**: The size of the thread pool processing data and error callbacks. If set to 0, automatically defaults to `std::thread::hardware_concurrency()`. Under the hood, this creates a vector of single-threaded worker pools. Incoming data callbacks for any single session are pinned to the same worker pool using a hash of the session ID. This guarantees **session affinity** (serial, in-order execution of callbacks for any single session) while allowing concurrent processing across different sessions.
 * **Receive Buffer Size**: The application-level receive buffer size. A hybrid stack/heap allocator is used to dynamically size the buffer on data reads.
 * **Send Chunk Size**: The maximum segment size transmitted per socket send operation.
 * **Max Outbound Buffer Size**: The maximum accumulated outbound buffer size (in bytes) allowed per connection. Defaults to 10MB (`10 * 1024 * 1024`). If a client's queued send data exceeds this, further writes fail to prevent unbounded memory growth.

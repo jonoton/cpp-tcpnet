@@ -12,7 +12,7 @@ layout: default
 The `cpp-tcpnet` library heavily utilizes multi-threading to ensure that network IO never blocks your main application logic.
 
 1. **Poll Loop Thread**: Both `TcpListener` and `TcpClient` spawn a dedicated background thread that uses `poll()` (or `WSAPoll` on Windows) to monitor socket activity non-blockingly.
-2. **Worker Pool**: When data arrives on a socket, it is read into a `std::vector<uint8_t>` and immediately dispatched to a `cppasyncworker::WorkerPool`. This allows your `DataHandler` callbacks to execute concurrently without stalling the `Poll Loop`.
+2. **Worker Pools (with Session Affinity)**: When data arrives on a socket, it is read and dispatched to one of several single-threaded worker pools (`cppasyncworker::WorkerPool`) based on a hash of the session ID. This ensures **session affinity**—meaning all callbacks for a specific session are executed sequentially and in-order, preventing race conditions within a session handler. Meanwhile, callbacks for different sessions are distributed across the worker pool threads to execute concurrently.
 3. **Event Broker**: State changes (like connection or disconnection) are published asynchronously via `cpppubsub::PubSub`, allowing any part of your application to react to network lifecycle events safely.
 
 ## Dependencies

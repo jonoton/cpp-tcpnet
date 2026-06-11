@@ -8,7 +8,7 @@
 - **DNS Resolution & IPv6:** Resolve hostnames dynamically on client connections. Fully supports both IPv4 and IPv6 (`AF_INET6`), including dual-stack wildcard binding.
 - **SSL/TLS Support:** Secure connections with OpenSSL (TLS 1.2+).
 - **Asynchronous & Non-Blocking:** High-performance background event loop ensures the main thread is never stalled by network IO.
-- **Built-in Thread Pool:** Automatically dispatches incoming packet data to a background worker pool for concurrent processing.
+- **Built-in Thread Pool with Session Affinity:** Automatically dispatches incoming packet data to a background worker pool, guaranteeing that callbacks for any single session are executed serially (in-order), while different sessions are processed concurrently.
 - **Event-Driven:** Uses the `cpp-pubsub` broker to publish events whenever connections connect or disconnect.
 - **Peer Address API:** Retrieve the remote peer's IP address and port for any active session with `GetPeerAddress(session_id)`.
 - **Zero-Copy Transmissions:** Safely bypass memory allocations and data copying during transmission using C++17 move semantics (`std::move`) or shared reference counts (`std::shared_ptr<const T>`).
@@ -118,6 +118,7 @@ ka.interval_secs = 10;
 ka.count = 3;
 client.SetKeepAliveConfig(ka);
 ```
+
 
 ## Connection Profiles
 
