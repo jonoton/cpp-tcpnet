@@ -981,8 +981,48 @@ TEST(TcpNetConfigTest, ProfileIdleTimeoutEnforcement) {
     listener.Stop();
 }
 
+// ===== Session Affinity Ordering Test =====
 
+TEST(TcpNetRegressionTest, SessionAffinitySerialExecution) {
+    cpptcpnet::TcpListener listener(8130);
+    listener.SetWorkerThreadCount(4);
+    
+    std::atomic<bool> concurrent_exec{false};
+    std::atomic<int> running_count{0};
+    std::atomic<int> total_processed{0};
+    
+    listener.SetDataHandler([&](uint64_t, const std::vector<uint8_t>&) {
+        int active = ++running_count;
+        if (active > 1) {
+            concurrent_exec.store(true);
+        }
+        
+        // Hold to simulate work
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        
+        --running_count;
+        total_processed.fetch_add(1);
+    });
+    
+    listener.Start();
+    
+    cpptcpnet::TcpClient client;
+    client.Start();
+    
+    uint64_t session_id = client.Connect("127.0.0.1", 8130);
+    ASSERT_GT(session_id, 0);
+    
+    // Flood with messages to provoke concurrency if affinity is broken
+    for (int i = 0; i < 20; ++i) {
+        client.Send(session_id, std::vector<uint8_t>{1});
+    }
+    
+    for (int i = 0; i < 100 && total_processed.load() < 20; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    
+    EXPECT_FALSE(concurrent_exec.load()) << "Callbacks were executed concurrently for the same session!";
 
-
-
-
+    client.Stop();
+    listener.Stop();
+}

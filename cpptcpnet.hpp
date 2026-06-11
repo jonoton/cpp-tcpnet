@@ -83,7 +83,7 @@ using pollfd_t = struct pollfd;
 namespace cpptcpnet
 {
     constexpr int VERSION_MAJOR = 1;
-    constexpr int VERSION_MINOR = 1;
+    constexpr int VERSION_MINOR = 2;
     constexpr int VERSION_PATCH = 0;
 
     /**
@@ -1525,7 +1525,15 @@ namespace cpptcpnet
             {
                 threads = std::thread::hardware_concurrency();
             }
-            worker_pool_ = std::make_unique<cppasyncworker::WorkerPool>(threads);
+            if (threads == 0)
+            {
+                threads = 1;
+            }
+            worker_pools_.resize(threads);
+            for (size_t i = 0; i < threads; ++i)
+            {
+                worker_pools_[i] = std::make_unique<cppasyncworker::WorkerPool>(1);
+            }
 
             running_ = true;
             try
@@ -1535,7 +1543,7 @@ namespace cpptcpnet
             catch (...)
             {
                 running_ = false;
-                worker_pool_.reset();
+                worker_pools_.clear();
                 CLOSE_SOCKET(server_fd_);
                 server_fd_ = INVALID_SOCKET;
                 wakeup_channel_.Close();
@@ -1670,7 +1678,7 @@ namespace cpptcpnet
             }
 #endif
             wakeup_channel_.Close();
-            worker_pool_.reset();
+            worker_pools_.clear();
         }
 
     public:
@@ -1860,7 +1868,7 @@ namespace cpptcpnet
         DataHandler data_handler_;
         ErrorHandler error_handler_;
         cpppubsub::PubSub broker_;
-        std::unique_ptr<cppasyncworker::WorkerPool> worker_pool_;
+        std::vector<std::unique_ptr<cppasyncworker::WorkerPool>> worker_pools_;
         std::atomic<size_t> worker_thread_count_{0};
         std::atomic<size_t> recv_buffer_size_{4096};
         std::atomic<size_t> send_chunk_size_{65536};
@@ -1931,10 +1939,10 @@ namespace cpptcpnet
                 std::lock_guard<std::mutex> lock(handler_mutex_);
                 err_handler = error_handler_;
             }
-            if (err_handler && worker_pool_)
+            if (err_handler && !worker_pools_.empty())
             {
-                (void)worker_pool_->Enqueue([err_handler, error_code, message]()
-                                            {
+                (void)worker_pools_[0]->Enqueue([err_handler, error_code, message]()
+                                                {
                     try
                     {
                         err_handler(error_code, message);
@@ -2489,10 +2497,11 @@ namespace cpptcpnet
                                 std::lock_guard<std::mutex> lock(handler_mutex_);
                                 handler = data_handler_;
                             }
-                            if (handler && worker_pool_)
+                            if (handler && !worker_pools_.empty())
                             {
-                                (void)worker_pool_->Enqueue([session_id, payload = std::move(payload), handler = std::move(handler)]()
-                                                            {
+                                size_t pool_idx = session_id % worker_pools_.size();
+                                (void)worker_pools_[pool_idx]->Enqueue([session_id, payload = std::move(payload), handler = std::move(handler)]()
+                                                                       {
                                      try
                                      {
                                          handler(session_id, payload);
@@ -2688,10 +2697,11 @@ namespace cpptcpnet
                         std::lock_guard<std::mutex> lock(handler_mutex_);
                         handler = data_handler_;
                     }
-                    if (handler && worker_pool_)
+                    if (handler && !worker_pools_.empty())
                     {
-                        (void)worker_pool_->Enqueue([session_id, payload = std::move(payload), handler = std::move(handler)]()
-                                                    {
+                        size_t pool_idx = session_id % worker_pools_.size();
+                        (void)worker_pools_[pool_idx]->Enqueue([session_id, payload = std::move(payload), handler = std::move(handler)]()
+                                                               {
                             try
                             {
                                 handler(session_id, payload);
@@ -3372,7 +3382,7 @@ namespace cpptcpnet
             }
 #endif
             wakeup_channel_.Close();
-            worker_pool_.reset();
+            worker_pools_.clear();
 
             std::vector<std::shared_ptr<ReconnectThreadInfo>> threads_to_join;
             {
@@ -3828,7 +3838,7 @@ namespace cpptcpnet
         DataHandler data_handler_;
         ErrorHandler error_handler_;
         cpppubsub::PubSub broker_;
-        std::unique_ptr<cppasyncworker::WorkerPool> worker_pool_;
+        std::vector<std::unique_ptr<cppasyncworker::WorkerPool>> worker_pools_;
         std::atomic<size_t> worker_thread_count_{0};
         std::atomic<size_t> recv_buffer_size_{4096};
         std::atomic<size_t> send_chunk_size_{65536};
@@ -3971,7 +3981,15 @@ namespace cpptcpnet
             {
                 threads = std::thread::hardware_concurrency();
             }
-            worker_pool_ = std::make_unique<cppasyncworker::WorkerPool>(threads);
+            if (threads == 0)
+            {
+                threads = 1;
+            }
+            worker_pools_.resize(threads);
+            for (size_t i = 0; i < threads; ++i)
+            {
+                worker_pools_[i] = std::make_unique<cppasyncworker::WorkerPool>(1);
+            }
 
             running_ = true;
             try
@@ -3981,7 +3999,7 @@ namespace cpptcpnet
             catch (...)
             {
                 running_ = false;
-                worker_pool_.reset();
+                worker_pools_.clear();
                 wakeup_channel_.Close();
                 Log(LogSeverity::Error, "TcpClient", "Failed to start poll loop thread.");
                 throw;
@@ -3996,10 +4014,10 @@ namespace cpptcpnet
                 std::lock_guard<std::mutex> lock(handler_mutex_);
                 err_handler = error_handler_;
             }
-            if (err_handler && worker_pool_)
+            if (err_handler && !worker_pools_.empty())
             {
-                (void)worker_pool_->Enqueue([err_handler, error_code, message]()
-                                            {
+                (void)worker_pools_[0]->Enqueue([err_handler, error_code, message]()
+                                                {
                     try
                     {
                         err_handler(error_code, message);
@@ -4524,10 +4542,11 @@ namespace cpptcpnet
                                     std::lock_guard<std::mutex> lock(handler_mutex_);
                                     handler = data_handler_;
                                 }
-                                if (handler && worker_pool_)
+                                if (handler && !worker_pools_.empty())
                                 {
-                                    (void)worker_pool_->Enqueue([session_id, payload = std::move(payload), handler = std::move(handler)]()
-                                                                {
+                                    size_t pool_idx = session_id % worker_pools_.size();
+                                    (void)worker_pools_[pool_idx]->Enqueue([session_id, payload = std::move(payload), handler = std::move(handler)]()
+                                                                           {
                                          try
                                          {
                                              handler(session_id, payload);
@@ -4718,10 +4737,11 @@ namespace cpptcpnet
                             std::lock_guard<std::mutex> lock(handler_mutex_);
                             handler = data_handler_;
                         }
-                        if (handler && worker_pool_)
+                        if (handler && !worker_pools_.empty())
                         {
-                            (void)worker_pool_->Enqueue([session_id, payload = std::move(payload), handler = std::move(handler)]()
-                                                        {
+                            size_t pool_idx = session_id % worker_pools_.size();
+                            (void)worker_pools_[pool_idx]->Enqueue([session_id, payload = std::move(payload), handler = std::move(handler)]()
+                                                                   {
                                 try
                                 {
                                     handler(session_id, payload);
