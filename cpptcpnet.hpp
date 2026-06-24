@@ -82,8 +82,8 @@ using pollfd_t = struct pollfd;
 
 namespace cpptcpnet {
 constexpr int VERSION_MAJOR = 1;
-constexpr int VERSION_MINOR = 2;
-constexpr int VERSION_PATCH = 2;
+constexpr int VERSION_MINOR = 3;
+constexpr int VERSION_PATCH = 0;
 
 /**
  * @brief Returns the library version as a string.

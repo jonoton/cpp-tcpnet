@@ -9,6 +9,9 @@ if(POLICY CMP0135)
     cmake_policy(SET CMP0135 NEW)
 endif()
 
+# Force dependencies in this directory scope and below to build as static libraries
+set(BUILD_SHARED_LIBS OFF)
+
 set(CPPTCPNET_PUBSUB_TAG "main" CACHE STRING "Git tag/branch to use for cpp-pubsub dependency")
 FetchContent_Declare(
   cpppubsub
