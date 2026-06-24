@@ -14,7 +14,7 @@ std::atomic<uint64_t> client_bytes_received(0);
 std::atomic<bool> client_connected(false);
 
 void RunServer() {
-  TcpListener server(8080);
+  TcpListener server(8085);
   cpppubsub::Worker worker;
   auto sub = server.GetEventBroker().Subscribe<ConnectionEvent>("state_events");
   worker.AddSubscription<ConnectionEvent>(sub, [](const ConnectionEvent& e) {
@@ -93,7 +93,7 @@ void RunClient() {
   const int max_retries = 15;
   for (int retry = 0; retry < max_retries; ++retry) {
     try {
-      client.Connect("127.0.0.1", 8080);
+      client.Connect("127.0.0.1", 8085);
       connected = true;
       break;
     } catch (const std::system_error& e) {
