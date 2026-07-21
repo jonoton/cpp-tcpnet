@@ -82,8 +82,8 @@ using pollfd_t = struct pollfd;
 
 namespace cpptcpnet {
 constexpr int VERSION_MAJOR = 1;
-constexpr int VERSION_MINOR = 3;
-constexpr int VERSION_PATCH = 1;
+constexpr int VERSION_MINOR = 4;
+constexpr int VERSION_PATCH = 0;
 
 /**
  * @brief Returns the library version as a string.
@@ -144,6 +144,16 @@ inline ScaledUnit ScaleBits(double bits_per_sec) {
     unit_idx++;
   }
   return {rate, units[unit_idx]};
+}
+
+/**
+ * @brief Performs a high-precision, CPU-friendly yield sleep until a target
+ * time point is reached. Helpful for sub-millisecond pacing delays.
+ */
+inline void PreciseSleepUntil(std::chrono::steady_clock::time_point target) {
+  while (std::chrono::steady_clock::now() < target) {
+    std::this_thread::yield();
+  }
 }
 
 /**

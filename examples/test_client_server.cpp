@@ -47,7 +47,8 @@ void RunServer() {
       std::cerr << "[Server] Timed out waiting for data." << std::endl;
       break;
     }
-    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    PreciseSleepUntil(std::chrono::steady_clock::now() +
+                      std::chrono::milliseconds(100));
   }
   // Wait for the client to disconnect after it has read all the echoed data
   while (server.GetStats().active_connections > 0) {
@@ -57,7 +58,8 @@ void RunServer() {
                 << std::endl;
       break;
     }
-    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    PreciseSleepUntil(std::chrono::steady_clock::now() +
+                      std::chrono::milliseconds(100));
   }
   server.Stop();
   worker.Stop();
@@ -99,7 +101,8 @@ void RunClient() {
     } catch (const std::system_error& e) {
       std::cout << "[Client] Connection attempt " << (retry + 1)
                 << " failed: " << e.what() << ". Retrying..." << std::endl;
-      std::this_thread::sleep_for(std::chrono::milliseconds(500));
+      PreciseSleepUntil(std::chrono::steady_clock::now() +
+                        std::chrono::milliseconds(500));
     }
   }
 
@@ -122,7 +125,8 @@ void RunClient() {
       worker.Stop();
       return;
     }
-    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    PreciseSleepUntil(std::chrono::steady_clock::now() +
+                      std::chrono::milliseconds(10));
   }
 
   std::cout << "[Client] Sending large payload..." << std::endl;
@@ -153,7 +157,8 @@ void RunClient() {
     if (current_send > peak_send) peak_send = current_send;
     if (current_recv > peak_recv) peak_recv = current_recv;
 
-    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    PreciseSleepUntil(std::chrono::steady_clock::now() +
+                      std::chrono::milliseconds(10));
   }
 
   auto transfer_end = std::chrono::steady_clock::now();
@@ -208,7 +213,8 @@ int main() {
       });
 
   std::thread server_thread(RunServer);
-  std::this_thread::sleep_for(std::chrono::milliseconds(500));
+  PreciseSleepUntil(std::chrono::steady_clock::now() +
+                    std::chrono::milliseconds(500));
   std::thread client_thread(RunClient);
 
   client_thread.join();

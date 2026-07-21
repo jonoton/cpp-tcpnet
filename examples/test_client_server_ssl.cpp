@@ -79,13 +79,14 @@ void RunServer() {
     server.Start();
     std::cout << "[Server] Started." << std::endl;
     auto server_start = std::chrono::steady_clock::now();
-    while (bytes_received < 10 * 1024 * 1024) {
+    while (bytes_received < 50 * 1024 * 1024) {
       if (std::chrono::steady_clock::now() - server_start >
           std::chrono::seconds(30)) {
         std::cerr << "[Server] Timed out waiting for data." << std::endl;
         break;
       }
-      std::this_thread::sleep_for(std::chrono::milliseconds(100));
+      PreciseSleepUntil(std::chrono::steady_clock::now() +
+                        std::chrono::milliseconds(100));
     }
     // Wait for the client to disconnect after it has read all the echoed data
     while (server.GetStats().active_connections > 0) {
@@ -95,7 +96,8 @@ void RunServer() {
                   << std::endl;
         break;
       }
-      std::this_thread::sleep_for(std::chrono::milliseconds(100));
+      PreciseSleepUntil(std::chrono::steady_clock::now() +
+                        std::chrono::milliseconds(100));
     }
     server.Stop();
     std::cout << "[Server] Stopped." << std::endl;
@@ -154,7 +156,8 @@ void RunClient() {
     } catch (const std::system_error& e) {
       std::cout << "[Client] Connection attempt " << (retry + 1)
                 << " failed: " << e.what() << ". Retrying..." << std::endl;
-      std::this_thread::sleep_for(std::chrono::milliseconds(500));
+      PreciseSleepUntil(std::chrono::steady_clock::now() +
+                        std::chrono::milliseconds(500));
     }
   }
 
@@ -177,12 +180,13 @@ void RunClient() {
       worker.Stop();
       return;
     }
-    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    PreciseSleepUntil(std::chrono::steady_clock::now() +
+                      std::chrono::milliseconds(10));
   }
 
   std::cout << "[Client] Sending secure payload..." << std::endl;
   // Send a 10MB payload securely
-  std::vector<uint8_t> large_payload(10 * 1024 * 1024, 'A');  // 10MB
+  std::vector<uint8_t> large_payload(50 * 1024 * 1024, 'A');  // 50MB
 
   ThroughputTracker tracker(client.GetEventBroker());
 
@@ -210,7 +214,8 @@ void RunClient() {
     if (current_send > peak_send) peak_send = current_send;
     if (current_recv > peak_recv) peak_recv = current_recv;
 
-    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    PreciseSleepUntil(std::chrono::steady_clock::now() +
+                      std::chrono::milliseconds(10));
   }
 
   auto transfer_end = std::chrono::steady_clock::now();
@@ -277,7 +282,8 @@ int main() {
   });
 
   std::thread server_thread(RunServer);
-  std::this_thread::sleep_for(std::chrono::milliseconds(1000));
+  PreciseSleepUntil(std::chrono::steady_clock::now() +
+                    std::chrono::milliseconds(1000));
   std::thread client_thread(RunClient);
 
   client_thread.join();
