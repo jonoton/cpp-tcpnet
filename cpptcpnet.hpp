@@ -49,6 +49,8 @@ using socket_buf_size_t = int;
 #define SEND_FLAGS 0
 #define TIMEOUT_ERROR_CODE WSAETIMEDOUT
 #define INTR_ERROR WSAEINTR
+#define CONN_ABORTED_ERROR WSAECONNABORTED
+#define CONN_REFUSED_ERROR WSAECONNREFUSED
 #else
 #include <arpa/inet.h>
 #include <fcntl.h>
@@ -75,6 +77,8 @@ using pollfd_t = struct pollfd;
 #endif
 #define TIMEOUT_ERROR_CODE ETIMEDOUT
 #define INTR_ERROR EINTR
+#define CONN_ABORTED_ERROR ECONNABORTED
+#define CONN_REFUSED_ERROR ECONNREFUSED
 #endif
 
 #include "cppasyncworker.hpp"
@@ -82,7 +86,7 @@ using pollfd_t = struct pollfd;
 
 namespace cpptcpnet {
 constexpr int VERSION_MAJOR = 1;
-constexpr int VERSION_MINOR = 4;
+constexpr int VERSION_MINOR = 5;
 constexpr int VERSION_PATCH = 0;
 
 /**
@@ -1312,6 +1316,11 @@ class TcpListener {
         ssl_ctx_ = nullptr;
         throw std::runtime_error("Private key does not match the certificate.");
       }
+#ifdef SSL_OP_IGNORE_UNEXPECTED_EOF
+      SSL_CTX_set_options(ssl_ctx_, SSL_OP_IGNORE_UNEXPECTED_EOF);
+#endif
+      SSL_CTX_set_mode(ssl_ctx_, SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER |
+                                    SSL_MODE_ENABLE_PARTIAL_WRITE);
     }
 #endif
 
@@ -1437,6 +1446,7 @@ class TcpListener {
       worker_pools_[i] = std::make_unique<cppasyncworker::WorkerPool>(1);
     }
 
+    loop_failed_ = false;
     running_ = true;
     try {
       loop_thread_ = std::thread(&TcpListener::RunPollLoop, this);
@@ -1520,9 +1530,12 @@ class TcpListener {
       std::lock_guard<std::mutex> lock(poll_mutex_);
 #ifdef CPPTCPNET_SSL_SUPPORT
       for (auto &pair : fd_to_ssl_) {
-        SSL_shutdown(pair.second);
+        if (!SSL_in_init(pair.second)) {
+          SSL_shutdown(pair.second);
+        }
         SSL_free(pair.second);
       }
+      ERR_clear_error();
       fd_to_ssl_.clear();
       ssl_handshaking_fds_.clear();
       ssl_read_wants_read_.clear();
@@ -1560,7 +1573,15 @@ class TcpListener {
   }
 
  public:
-  bool IsRunning() const { return running_.load(std::memory_order_relaxed); }
+  /**
+   * @brief Returns true while the server is started and its event loop is
+   * alive. Returns false after Stop(), or if the event loop exited due to a
+   * fatal error (call Stop() before calling Start() again in that case).
+   */
+  bool IsRunning() const {
+    return running_.load(std::memory_order_relaxed) &&
+           !loop_failed_.load(std::memory_order_relaxed);
+  }
 
   bool Disconnect(uint64_t session_id) {
     socket_t client_fd = INVALID_SOCKET;
@@ -1659,6 +1680,9 @@ class TcpListener {
   std::string bind_address_;
   size_t max_clients_;
   std::atomic<bool> running_;
+  // Set by the poll thread when the event loop exits due to a fatal error.
+  // running_ is left untouched so Stop() still performs full cleanup.
+  std::atomic<bool> loop_failed_{false};
   socket_t server_fd_;
   std::thread loop_thread_;
   std::vector<pollfd_t> poll_fds_;
@@ -1972,15 +1996,35 @@ class TcpListener {
       if (poll_count < 0) {
         if (running_) {
           ReportError(GetLastSocketError(), "Poll error.");
+          HandleLoopFailure();
         }
         break;
       }
       if (poll_count == 0) continue;
 
+      bool fatal_error = false;
       for (size_t i = 0; i < poll_fds_copy.size(); ++i) {
         if (poll_fds_copy[i].revents & (POLLIN | POLLOUT | POLLERR | POLLHUP)) {
           if (poll_fds_copy[i].fd == server_fd_) {
-            if (poll_fds_copy[i].revents & POLLIN) AcceptConnection();
+            if (poll_fds_copy[i].revents & POLLIN) {
+              AcceptConnection();
+            }
+            if (poll_fds_copy[i].revents & (POLLERR | POLLHUP)) {
+              int err = 0;
+              socklen_t len = sizeof(err);
+              if (getsockopt(server_fd_, SOL_SOCKET, SO_ERROR,
+                             reinterpret_cast<char *>(&err), &len) < 0) {
+                err = GetLastSocketError();
+              } else if (err == 0) {
+                // poll() does not set errno; avoid reporting a stale value.
+                err = CONN_ABORTED_ERROR;
+              }
+              ReportError(err, "Server listening socket error or hangup.");
+              // Leave running_ untouched so Stop() still joins the thread
+              // and releases resources (same as the poll() error path).
+              fatal_error = true;
+              break;
+            }
           } else if (poll_fds_copy[i].fd == wakeup_channel_.ReadFd()) {
             if (poll_fds_copy[i].revents & POLLIN) wakeup_channel_.Clear();
           } else {
@@ -2002,7 +2046,35 @@ class TcpListener {
           }
         }
       }
+      if (fatal_error) {
+        HandleLoopFailure();
+        break;
+      }
     }
+  }
+
+  /**
+   * @brief Called on the poll thread when the event loop must exit due to an
+   * unrecoverable error. Marks the loop as failed so IsRunning() returns false
+   * and disconnects every client so each session receives a Disconnected
+   * event. running_ is intentionally left set so Stop() still cleans up.
+   */
+  void HandleLoopFailure() {
+    loop_failed_ = true;
+    std::vector<socket_t> client_fds;
+    {
+      std::lock_guard<std::mutex> lock(poll_mutex_);
+      client_fds.reserve(fd_to_session_.size());
+      for (const auto &pair : fd_to_session_) {
+        client_fds.push_back(pair.first);
+      }
+    }
+    for (socket_t fd : client_fds) {
+      DisconnectClient(fd);
+    }
+    Log(LogSeverity::Error, "TcpListener",
+        "Event loop stopped after a fatal error. Call Stop() before "
+        "restarting.");
   }
 
   void AcceptConnection() {
@@ -2133,6 +2205,7 @@ class TcpListener {
       ssl = it->second;
     }
 
+    ERR_clear_error();
     int ret = SSL_accept(ssl);
     if (ret <= 0) {
       int err = SSL_get_error(ssl, ret);
@@ -2165,7 +2238,9 @@ class TcpListener {
             "SSL handshake failed for fd " + std::to_string(client_fd) + ": " +
                 errbuf);
       }
+      ERR_clear_error();
     } else {
+      ERR_clear_error();
       {
         std::lock_guard<std::mutex> lock(poll_mutex_);
         ssl_handshaking_fds_.erase(client_fd);
@@ -2216,9 +2291,10 @@ class TcpListener {
     {
       std::lock_guard<std::mutex> lock(poll_mutex_);
       auto it = fd_to_session_.find(client_fd);
-      if (it != fd_to_session_.end()) {
-        session_id = it->second;
+      if (it == fd_to_session_.end()) {
+        return;
       }
+      session_id = it->second;
       auto prof_it = socket_profiles_.find(client_fd);
       prof = (prof_it != socket_profiles_.end()) ? prof_it->second
                                                  : default_profile_;
@@ -2289,6 +2365,7 @@ class TcpListener {
           int bytes_read = 0;
           int err = 0;
           while (running_) {
+            ERR_clear_error();
             bytes_read = SSL_read(ssl, buffer, static_cast<int>(buf_size));
             if (bytes_read >= 0) break;
             err = SSL_get_error(ssl, bytes_read);
@@ -2342,6 +2419,7 @@ class TcpListener {
           } else if (bytes_read == 0) {
             disconnect = true;
             read_more = false;
+            ERR_clear_error();
           } else {
             read_more = false;
             if (err == SSL_ERROR_WANT_READ) {
@@ -2355,6 +2433,7 @@ class TcpListener {
             } else {
               disconnect = true;
             }
+            ERR_clear_error();
           }
         }
       }
@@ -2373,6 +2452,7 @@ class TcpListener {
             int sent = 0;
             int err = 0;
             while (running_) {
+              ERR_clear_error();
               sent = SSL_write(ssl, chunk.ptr(), static_cast<int>(to_send));
               if (sent > 0) break;
               err = SSL_get_error(ssl, sent);
@@ -2404,6 +2484,7 @@ class TcpListener {
               } else {
                 disconnect = true;
               }
+              ERR_clear_error();
             }
           }
 
@@ -2458,6 +2539,10 @@ class TcpListener {
             break;
           }
         }
+      }
+
+      if (!disconnect && (pfd.revents & (POLLERR | POLLHUP))) {
+        disconnect = true;
       }
 
       if (disconnect) {
@@ -2608,8 +2693,11 @@ class TcpListener {
       ssl_write_wants_write_.erase(client_fd);
     }
     if (ssl) {
-      SSL_shutdown(ssl);
+      if (!SSL_in_init(ssl)) {
+        SSL_shutdown(ssl);
+      }
       SSL_free(ssl);
+      ERR_clear_error();
     }
 #endif
     uint64_t session_id = 0;
@@ -3086,9 +3174,12 @@ class TcpClient {
       std::lock_guard<std::mutex> lock(poll_mutex_);
 #ifdef CPPTCPNET_SSL_SUPPORT
       for (auto &pair : fd_to_ssl_) {
-        SSL_shutdown(pair.second);
+        if (!SSL_in_init(pair.second)) {
+          SSL_shutdown(pair.second);
+        }
         SSL_free(pair.second);
       }
+      ERR_clear_error();
       fd_to_ssl_.clear();
       ssl_handshaking_fds_.clear();
       ssl_read_wants_read_.clear();
@@ -3148,6 +3239,11 @@ class TcpClient {
   uint64_t Connect(const std::string &ip_address, uint16_t port) {
     std::lock_guard<std::mutex> lifecycle_lock(lifecycle_mutex_);
     if (!running_) StartInternal();
+    if (loop_failed_) {
+      throw std::runtime_error(
+          "[TcpClient] Event loop stopped after a fatal error. Call Stop() "
+          "before connecting again.");
+    }
 
     struct addrinfo hints {};
     hints.ai_family = AF_UNSPEC;
@@ -3307,9 +3403,14 @@ class TcpClient {
 
   /**
    * @brief Checks if the client event loop is currently running.
-   * @return True if running, false otherwise.
+   * @return True if started and the event loop is alive. False after Stop(),
+   * or if the event loop exited due to a fatal error (call Stop() before
+   * reusing the client in that case).
    */
-  bool IsRunning() const { return running_.load(std::memory_order_relaxed); }
+  bool IsRunning() const {
+    return running_.load(std::memory_order_relaxed) &&
+           !loop_failed_.load(std::memory_order_relaxed);
+  }
 
   /**
    * @brief Programmatically disconnects a connection by its session ID.
@@ -3456,6 +3557,9 @@ class TcpClient {
       last_activity_time_;
 
   std::atomic<bool> running_;
+  // Set by the poll thread when the event loop exits due to a fatal error.
+  // running_ is left untouched so Stop() still performs full cleanup.
+  std::atomic<bool> loop_failed_{false};
   std::thread loop_thread_;
   std::vector<pollfd_t> poll_fds_;
   // Lock ordering convention: Always acquire poll_mutex_ BEFORE outbound_mutex_
@@ -3674,6 +3778,11 @@ class TcpClient {
               "Client private key does not match certificate.");
         }
       }
+#ifdef SSL_OP_IGNORE_UNEXPECTED_EOF
+      SSL_CTX_set_options(ssl_ctx_, SSL_OP_IGNORE_UNEXPECTED_EOF);
+#endif
+      SSL_CTX_set_mode(ssl_ctx_, SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER |
+                                    SSL_MODE_ENABLE_PARTIAL_WRITE);
     }
 #endif
     if (!wakeup_channel_.Initialize()) {
@@ -3693,6 +3802,7 @@ class TcpClient {
       worker_pools_[i] = std::make_unique<cppasyncworker::WorkerPool>(1);
     }
 
+    loop_failed_ = false;
     running_ = true;
     try {
       loop_thread_ = std::thread(&TcpClient::RunPollLoop, this);
@@ -3868,6 +3978,7 @@ class TcpClient {
       if (poll_count < 0) {
         if (running_) {
           ReportError(GetLastSocketError(), "Poll error.");
+          HandleLoopFailure();
         }
         break;
       }
@@ -3885,6 +3996,31 @@ class TcpClient {
     }
   }
 
+  /**
+   * @brief Called on the poll thread when the event loop must exit due to an
+   * unrecoverable error. Marks the loop as failed so IsRunning() returns false
+   * and disconnects every server connection so each session receives a
+   * Disconnected event. Auto-reconnect is suppressed while failed. running_ is
+   * intentionally left set so Stop() still cleans up.
+   */
+  void HandleLoopFailure() {
+    loop_failed_ = true;
+    std::vector<socket_t> fds;
+    {
+      std::lock_guard<std::mutex> lock(poll_mutex_);
+      fds.reserve(fd_to_session_.size());
+      for (const auto &pair : fd_to_session_) {
+        fds.push_back(pair.first);
+      }
+    }
+    for (socket_t fd : fds) {
+      DisconnectServer(fd);
+    }
+    Log(LogSeverity::Error, "TcpClient",
+        "Event loop stopped after a fatal error. Call Stop() before reusing "
+        "the client.");
+  }
+
 #ifdef CPPTCPNET_SSL_SUPPORT
   void HandleSslHandshake(socket_t fd, uint64_t session_id, bool &disconnect) {
     SSL *ssl = nullptr;
@@ -3895,6 +4031,7 @@ class TcpClient {
       ssl = it->second;
     }
 
+    ERR_clear_error();
     int ret = SSL_connect(ssl);
     if (ret <= 0) {
       int err = SSL_get_error(ssl, ret);
@@ -3926,7 +4063,9 @@ class TcpClient {
         Log(LogSeverity::Warning, "TcpClient",
             "SSL handshake failed: " + std::string(errbuf));
       }
+      ERR_clear_error();
     } else {
+      ERR_clear_error();
       {
         std::lock_guard<std::mutex> lock(poll_mutex_);
         ssl_handshaking_fds_.erase(fd);
@@ -3977,9 +4116,10 @@ class TcpClient {
     {
       std::lock_guard<std::mutex> lock(poll_mutex_);
       auto it = fd_to_session_.find(fd);
-      if (it != fd_to_session_.end()) {
-        session_id = it->second;
+      if (it == fd_to_session_.end()) {
+        return;
       }
+      session_id = it->second;
       auto prof_it = socket_profiles_.find(fd);
       prof = (prof_it != socket_profiles_.end()) ? prof_it->second
                                                  : default_profile_;
@@ -4002,9 +4142,12 @@ class TcpClient {
         error = GetLastSocketError();
       }
 
-      if (error != 0) {
+      if (error != 0 || (pfd.revents & (POLLERR | POLLHUP))) {
         disconnect = true;
-        ReportError(error, "Connection failed asynchronously.");
+        // poll() does not set errno; if SO_ERROR is 0, report a fixed code
+        // rather than a stale errno value.
+        ReportError(error != 0 ? error : CONN_REFUSED_ERROR,
+                    "Connection failed asynchronously.");
       } else {
         // Successfully connected
 #ifdef CPPTCPNET_SSL_SUPPORT
@@ -4154,6 +4297,7 @@ class TcpClient {
             int bytes_read = 0;
             int err = 0;
             while (running_) {
+              ERR_clear_error();
               bytes_read = SSL_read(ssl, buffer, static_cast<int>(buf_size));
               if (bytes_read >= 0) break;
               err = SSL_get_error(ssl, bytes_read);
@@ -4203,6 +4347,7 @@ class TcpClient {
             } else if (bytes_read == 0) {
               disconnect = true;
               read_more = false;
+              ERR_clear_error();
             } else {
               read_more = false;
               if (err == SSL_ERROR_WANT_READ) {
@@ -4216,6 +4361,7 @@ class TcpClient {
               } else {
                 disconnect = true;
               }
+              ERR_clear_error();
             }
           }
         }
@@ -4234,6 +4380,7 @@ class TcpClient {
               int sent = 0;
               int err = 0;
               while (running_) {
+                ERR_clear_error();
                 sent = SSL_write(ssl, chunk.ptr(), static_cast<int>(to_send));
                 if (sent > 0) break;
                 err = SSL_get_error(ssl, sent);
@@ -4265,6 +4412,7 @@ class TcpClient {
                 } else {
                   disconnect = true;
                 }
+                ERR_clear_error();
               }
             }
 
@@ -4315,6 +4463,10 @@ class TcpClient {
               break;
             }
           }
+        }
+
+        if (!disconnect && (pfd.revents & (POLLERR | POLLHUP))) {
+          disconnect = true;
         }
 
         if (disconnect) {
@@ -4467,8 +4619,11 @@ class TcpClient {
       ssl_write_wants_write_.erase(fd);
     }
     if (ssl) {
-      SSL_shutdown(ssl);
+      if (!SSL_in_init(ssl)) {
+        SSL_shutdown(ssl);
+      }
       SSL_free(ssl);
+      ERR_clear_error();
     }
 #endif
     uint64_t session_id = 0;
@@ -4514,7 +4669,7 @@ class TcpClient {
     }
 
     if (has_target && auto_reconnect_enabled_.load(std::memory_order_relaxed) &&
-        running_) {
+        running_ && !loop_failed_) {
       std::lock_guard<std::mutex> lock(poll_mutex_);
       if (reconnecting_targets_.find(target) == reconnecting_targets_.end()) {
         reconnecting_targets_.insert(target);
@@ -4535,16 +4690,17 @@ class TcpClient {
         auto info = std::make_shared<ReconnectThreadInfo>();
         info->thread = std::thread([this, target, info]() {
           std::chrono::milliseconds current_delay = reconnect_initial_delay_;
-          while (running_) {
+          auto active = [this]() { return running_ && !loop_failed_; };
+          while (active()) {
             auto sleep_start = std::chrono::steady_clock::now();
-            while (running_) {
+            while (active()) {
               if (std::chrono::steady_clock::now() - sleep_start >=
                   current_delay) {
                 break;
               }
               std::this_thread::sleep_for(std::chrono::milliseconds(50));
             }
-            if (!running_) break;
+            if (!active()) break;
 
             uint64_t new_session = 0;
             bool connect_initiated = false;
@@ -4560,7 +4716,7 @@ class TcpClient {
             if (connect_initiated) {
               bool resolved = false;
               bool success = false;
-              while (running_ && !resolved) {
+              while (active() && !resolved) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(50));
                 std::lock_guard<std::mutex> lock_state(poll_mutex_);
                 auto it = session_to_fd_.find(new_session);
@@ -4577,7 +4733,7 @@ class TcpClient {
                 }
               }
 
-              if (!running_) break;
+              if (!active()) break;
 
               if (success) {
                 Log(LogSeverity::Info, "TcpClient",

@@ -189,6 +189,74 @@ TEST(TcpNetRegressionTest, ClientConnectAndDisconnectEvents) {
   worker.Stop();
 }
 
+// Connecting to a port with no listener must report an error, never publish
+// Connected, drop the session, and leave the client event loop alive.
+TEST(TcpNetRegressionTest, ClientConnectRefusedReportsError) {
+  constexpr uint16_t kPort = 8098;
+  {
+    // Bind and release the port so nothing is listening on it.
+    cpptcpnet::TcpListener listener(kPort, "127.0.0.1");
+    listener.Start();
+    listener.Stop();
+  }
+
+  cpptcpnet::TcpClient client;
+  std::atomic<bool> error_fired{false};
+  std::atomic<int> error_code{0};
+  client.SetErrorHandler([&](int code, const std::string&) {
+    error_code.store(code);
+    error_fired.store(true);
+  });
+
+  std::atomic<bool> connected{false};
+  cpppubsub::Worker worker;
+  auto sub = client.GetEventBroker().Subscribe<cpptcpnet::ConnectionEvent>(
+      "state_events");
+  worker.AddSubscription<cpptcpnet::ConnectionEvent>(
+      sub, [&](const cpptcpnet::ConnectionEvent& e) {
+        if (e.state == cpptcpnet::ConnectionState::Connected) {
+          connected.store(true);
+        }
+      });
+  worker.Start();
+
+  uint64_t session_id = 0;
+  try {
+    session_id = client.Connect("127.0.0.1", kPort);
+  } catch (const std::system_error&) {
+    // Some platforms refuse a loopback connect synchronously; that is also a
+    // correct outcome for this test.
+    client.Stop();
+    worker.Stop();
+    return;
+  }
+  EXPECT_GT(session_id, 0u);
+
+  for (int i = 0; i < 200 && !error_fired.load(); ++i) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  }
+  EXPECT_TRUE(error_fired.load());
+  EXPECT_NE(error_code.load(), 0);
+  EXPECT_FALSE(connected.load());
+
+  // The failed session must be gone, but the event loop must still be alive.
+  // The error handler can run before the poll thread finishes cleanup, so
+  // wait briefly for the session to be removed.
+  std::vector<uint8_t> payload = {'x'};
+  bool session_removed = false;
+  for (int i = 0; i < 100 && !session_removed; ++i) {
+    session_removed = !client.Send(session_id, payload);
+    if (!session_removed) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+  }
+  EXPECT_TRUE(session_removed);
+  EXPECT_TRUE(client.IsRunning());
+
+  client.Stop();
+  worker.Stop();
+}
+
 // Large payload round-trip — exercises send clamping + POLLOUT buffering
 TEST(TcpNetRegressionTest, LargePayloadSendReceive) {
   const size_t payload_size = 2 * 1024 * 1024;  // 2MB
