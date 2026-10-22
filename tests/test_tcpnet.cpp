@@ -1134,3 +1134,158 @@ TEST(TcpNetRegressionTest, SessionAffinitySerialExecution) {
   client.Stop();
   listener.Stop();
 }
+
+TEST(TcpNetRegressionTest, ListenerDisconnectServerSide) {
+  cpptcpnet::TcpListener listener(8140);
+  listener.Start();
+
+  cpptcpnet::TcpClient client;
+  client.Start();
+
+  std::atomic<bool> client_disconnected{false};
+  cpppubsub::Worker worker;
+  auto sub = client.GetEventBroker().Subscribe<cpptcpnet::ConnectionEvent>(
+      "state_events");
+  worker.AddSubscription<cpptcpnet::ConnectionEvent>(
+      sub, [&](const cpptcpnet::ConnectionEvent& e) {
+        if (e.state == cpptcpnet::ConnectionState::Disconnected) {
+          client_disconnected.store(true);
+        }
+      });
+  worker.Start();
+
+  uint64_t client_session_id = client.Connect("127.0.0.1", 8140);
+  ASSERT_GT(client_session_id, 0);
+
+  // Wait for connection to establish
+  for (int i = 0; i < 50 && listener.GetActiveSessions().empty(); ++i) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  }
+  auto sessions = listener.GetActiveSessions();
+  ASSERT_EQ(sessions.size(), 1);
+  uint64_t server_session_id = sessions[0];
+
+  // Disconnect from server side
+  EXPECT_TRUE(listener.Disconnect(server_session_id));
+
+  // Immediate subsequent Disconnect returns false (already disconnecting / disconnected)
+  EXPECT_FALSE(listener.Disconnect(server_session_id));
+
+  // Send should immediately be rejected
+  EXPECT_FALSE(listener.Send(server_session_id, "hello"));
+
+  // Active sessions should immediately exclude the disconnected session
+  EXPECT_EQ(listener.GetActiveSessions().size(), 0);
+
+  // Client should receive disconnected event
+  for (int i = 0; i < 100 && !client_disconnected.load(); ++i) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  }
+  EXPECT_TRUE(client_disconnected.load());
+
+  client.Stop();
+  worker.Stop();
+  listener.Stop();
+}
+
+TEST(TcpNetRegressionTest, ListenerDisconnectConcurrentAndRepeated) {
+  cpptcpnet::TcpListener listener(8141);
+  listener.Start();
+
+  cpptcpnet::TcpClient client;
+  client.Start();
+
+  uint64_t client_session_id = client.Connect("127.0.0.1", 8141);
+  ASSERT_GT(client_session_id, 0);
+
+  for (int i = 0; i < 50 && listener.GetActiveSessions().empty(); ++i) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  }
+  auto sessions = listener.GetActiveSessions();
+  ASSERT_EQ(sessions.size(), 1);
+  uint64_t server_session_id = sessions[0];
+
+  constexpr int num_threads = 8;
+  std::vector<std::thread> threads;
+  std::atomic<int> success_count{0};
+  std::atomic<bool> start_gate{false};
+
+  for (int i = 0; i < num_threads; ++i) {
+    threads.emplace_back([&]() {
+      while (!start_gate.load(std::memory_order_relaxed)) {
+        std::this_thread::yield();
+      }
+      if (listener.Disconnect(server_session_id)) {
+        success_count.fetch_add(1, std::memory_order_relaxed);
+      }
+    });
+  }
+
+  start_gate.store(true, std::memory_order_relaxed);
+  for (auto& t : threads) {
+    t.join();
+  }
+
+  // Exactly one caller should have succeeded; all others should be false
+  EXPECT_EQ(success_count.load(), 1);
+
+  // Give the event loop time to process the wake-up
+  std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  EXPECT_EQ(listener.GetActiveSessions().size(), 0);
+
+  client.Stop();
+  listener.Stop();
+}
+
+TEST(TcpNetRegressionTest, ListenerDisconnectFromDataHandler) {
+  cpptcpnet::TcpListener listener(8142);
+  std::atomic<bool> handler_called{false};
+  std::atomic<bool> disconnect_result{false};
+
+  listener.SetDataHandler([&](uint64_t session_id, const std::vector<uint8_t>&) {
+    handler_called.store(true);
+    disconnect_result.store(listener.Disconnect(session_id));
+  });
+  listener.Start();
+
+  cpptcpnet::TcpClient client;
+  client.Start();
+
+  std::atomic<bool> client_disconnected{false};
+  cpppubsub::Worker worker;
+  auto sub = client.GetEventBroker().Subscribe<cpptcpnet::ConnectionEvent>(
+      "state_events");
+  worker.AddSubscription<cpptcpnet::ConnectionEvent>(
+      sub, [&](const cpptcpnet::ConnectionEvent& e) {
+        if (e.state == cpptcpnet::ConnectionState::Disconnected) {
+          client_disconnected.store(true);
+        }
+      });
+  worker.Start();
+
+  uint64_t client_session_id = client.Connect("127.0.0.1", 8142);
+  ASSERT_GT(client_session_id, 0);
+
+  for (int i = 0; i < 50 && listener.GetActiveSessions().empty(); ++i) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  }
+
+  // Send payload to trigger data handler on worker thread
+  client.Send(client_session_id, std::vector<uint8_t>{1, 2, 3});
+
+  for (int i = 0; i < 100 && !handler_called.load(); ++i) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  }
+  EXPECT_TRUE(handler_called.load());
+  EXPECT_TRUE(disconnect_result.load());
+
+  for (int i = 0; i < 100 && !client_disconnected.load(); ++i) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  }
+  EXPECT_TRUE(client_disconnected.load());
+
+  client.Stop();
+  worker.Stop();
+  listener.Stop();
+}
+

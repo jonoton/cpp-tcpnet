@@ -86,7 +86,7 @@ using pollfd_t = struct pollfd;
 
 namespace cpptcpnet {
 constexpr int VERSION_MAJOR = 1;
-constexpr int VERSION_MINOR = 5;
+constexpr int VERSION_MINOR = 6;
 constexpr int VERSION_PATCH = 0;
 
 /**
@@ -1557,6 +1557,7 @@ class TcpListener {
       session_to_fd_.clear();
       last_activity_time_.clear();
       last_write_time_.clear();
+      pending_disconnects_.clear();
     }
     {
       std::lock_guard<std::mutex> out_lock(outbound_mutex_);
@@ -1585,18 +1586,37 @@ class TcpListener {
 
   bool Disconnect(uint64_t session_id) {
     socket_t client_fd = INVALID_SOCKET;
+    bool defer = false;
     {
       std::lock_guard<std::mutex> lock(poll_mutex_);
+      if (pending_disconnects_.find(session_id) != pending_disconnects_.end()) {
+        return false;
+      }
       auto it = session_to_fd_.find(session_id);
       if (it != session_to_fd_.end()) {
         client_fd = it->second;
       }
+      // DisconnectClient() frees the SSL object and closes the socket. If the
+      // poll thread is alive and we are NOT on it, it may concurrently be
+      // inside SSL_read()/SSL_do_handshake() on this very connection (those
+      // run outside poll_mutex_). Freeing it here would be a use-after-free,
+      // so hand the request to the poll thread, which owns connection teardown.
+      if (client_fd != INVALID_SOCKET && running_ && !loop_failed_ &&
+          loop_thread_.joinable() &&
+          loop_thread_.get_id() != std::this_thread::get_id()) {
+        pending_disconnects_.insert(session_id);
+        defer = true;
+      }
     }
-    if (client_fd != INVALID_SOCKET) {
+    if (client_fd == INVALID_SOCKET) {
+      return false;
+    }
+    if (defer) {
+      wakeup_channel_.Trigger();
+    } else {
       DisconnectClient(client_fd);
-      return true;
     }
-    return false;
+    return true;
   }
 
   std::vector<uint64_t> GetActiveSessions() const {
@@ -1604,7 +1624,9 @@ class TcpListener {
     std::vector<uint64_t> sessions;
     sessions.reserve(session_to_fd_.size());
     for (const auto &pair : session_to_fd_) {
-      sessions.push_back(pair.first);
+      if (pending_disconnects_.find(pair.first) == pending_disconnects_.end()) {
+        sessions.push_back(pair.first);
+      }
     }
     return sessions;
   }
@@ -1617,6 +1639,10 @@ class TcpListener {
    */
   PeerAddress GetPeerAddress(uint64_t session_id) const {
     std::lock_guard<std::mutex> lock(poll_mutex_);
+    if (pending_disconnects_.find(session_id) != pending_disconnects_.end()) {
+      throw std::runtime_error("Session not found: " +
+                               std::to_string(session_id));
+    }
     auto it = session_to_fd_.find(session_id);
     if (it == session_to_fd_.end()) {
       throw std::runtime_error("Session not found: " +
@@ -1670,7 +1696,10 @@ class TcpListener {
         total_connections_.load(std::memory_order_relaxed);
     {
       std::lock_guard<std::mutex> lock(poll_mutex_);
-      stats.active_connections = fd_to_session_.size();
+      stats.active_connections =
+          (fd_to_session_.size() > pending_disconnects_.size())
+              ? (fd_to_session_.size() - pending_disconnects_.size())
+              : 0;
     }
     return stats;
   }
@@ -1698,6 +1727,12 @@ class TcpListener {
     }
 
     std::lock_guard<std::mutex> poll_lock(poll_mutex_);
+    if (pending_disconnects_.find(session_id) != pending_disconnects_.end()) {
+      Log(LogSeverity::Warning, "TcpListener",
+          "Send called on disconnecting session_id: " +
+              std::to_string(session_id));
+      return false;
+    }
     auto it = session_to_fd_.find(session_id);
     if (it == session_to_fd_.end()) {
       Log(LogSeverity::Warning, "TcpListener",
@@ -1770,6 +1805,11 @@ class TcpListener {
   internal::WakeUpChannel wakeup_channel_;
   std::unordered_map<socket_t, uint64_t> fd_to_session_;
   std::unordered_map<uint64_t, socket_t> session_to_fd_;
+  // Session IDs whose teardown was requested from a non-poll thread. Guarded
+  // by poll_mutex_ and drained by the poll thread (see Disconnect()). Session
+  // IDs (not fds) are queued so a recycled fd is never closed by mistake, and
+  // an unordered_set prevents duplicate close attempts.
+  std::unordered_set<uint64_t> pending_disconnects_;
   std::unordered_map<socket_t, std::chrono::steady_clock::time_point>
       last_activity_time_;
   std::unordered_map<socket_t, std::chrono::steady_clock::time_point>
@@ -1905,6 +1945,23 @@ class TcpListener {
       }
 #endif
 
+      // Process disconnects requested from other threads (see Disconnect()).
+      // Done here so SSL_free()/close() never race with SSL I/O on this thread.
+      std::vector<socket_t> deferred_disconnect_fds;
+      {
+        std::lock_guard<std::mutex> lock(poll_mutex_);
+        for (uint64_t sid : pending_disconnects_) {
+          auto it = session_to_fd_.find(sid);
+          if (it != session_to_fd_.end()) {
+            deferred_disconnect_fds.push_back(it->second);
+          }
+        }
+        pending_disconnects_.clear();
+      }
+      for (auto client_fd : deferred_disconnect_fds) {
+        DisconnectClient(client_fd);
+      }
+
       // Check idle timeouts
       std::vector<socket_t> idle_connections;
       {
@@ -2035,7 +2092,9 @@ class TcpListener {
                 std::lock_guard<std::mutex> lock(poll_mutex_);
                 auto it = fd_to_session_.find(poll_fds_copy[i].fd);
                 if (it != fd_to_session_.end() &&
-                    it->second == expected_session_id) {
+                    it->second == expected_session_id &&
+                    pending_disconnects_.find(expected_session_id) ==
+                        pending_disconnects_.end()) {
                   session_valid = true;
                 }
               }
@@ -2708,6 +2767,7 @@ class TcpListener {
         session_id = it_sess->second;
         fd_to_session_.erase(it_sess);
         session_to_fd_.erase(session_id);
+        pending_disconnects_.erase(session_id);
       }
       socket_profiles_.erase(client_fd);
       last_activity_time_.erase(client_fd);
