@@ -1,3 +1,8 @@
+// cpp-tcpnet - A fast, cross-platform, and asynchronous C++17 library for TCP networking
+// https://github.com/jonoton/cpp-tcpnet
+// Copyright (c) 2026 cpp-tcpnet
+// Licensed under the MIT License. SPDX-License-Identifier: MIT
+
 #pragma once
 
 #include <algorithm>
@@ -86,7 +91,7 @@ using pollfd_t = struct pollfd;
 
 namespace cpptcpnet {
 constexpr int VERSION_MAJOR = 1;
-constexpr int VERSION_MINOR = 6;
+constexpr int VERSION_MINOR = 7;
 constexpr int VERSION_PATCH = 0;
 
 /**
